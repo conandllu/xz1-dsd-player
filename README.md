@@ -171,6 +171,25 @@ adb install -r app/build/outputs/apk/dsd/debug/app-dsd-debug.apk
 adb shell appops set com.dsd.player MANAGE_EXTERNAL_STORAGE allow   # 或应用内点「所有文件访问」
 ```
 
+### release 签名（发布 APK 用）
+
+仓库里**不含任何密钥**。要出签名包，在项目根放一个 `keystore.properties`（已在 `.gitignore` 里）：
+
+```properties
+storeFile=/绝对路径/xz1-dsd-player.jks
+storePassword=…
+keyAlias=xz1dsd
+keyPassword=…
+```
+
+```bash
+./gradlew assembleDsdRelease assembleCompanionRelease
+# → app/build/outputs/apk/<flavour>/release/app-*-release.apk（v2 签名）
+```
+
+没有这个文件时 `assembleDsdRelease` 仍能跑，只是产出未签名的 APK（CI 里够用）。
+上传到 GitHub Release：`GITHUB_TOKEN=… scripts/github_release.sh`（见脚本头部说明，支持 `DRY_RUN=1`）。
+
 要给别的 NDK / 新 ABI 重编 libusb：
 
 ```bash
