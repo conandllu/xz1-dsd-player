@@ -112,7 +112,7 @@ for a in json.load(sys.stdin):
   say "上传 $n ($(stat -c%s "$f") B)…"
   RESP=$(api "上传 $n" POST "https://uploads.github.com/repos/$REPO/releases/$REL_ID/assets?name=$n" \
          -H "Content-Type: application/vnd.android.package-archive" --data-binary @"$f")
-  printf '%s' "$RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"        → {d[\"name\"]}  {d[\"size\"]} B  state={d[\"state\"]}")'
+  printf '%s' "$RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("        → " + d["name"] + "  " + str(d["size"]) + " B  state=" + d["state"])'
 done
 
 # 3) 回读校验
@@ -121,8 +121,9 @@ if [ "$DRY_RUN" != "1" ]; then
   curl -fsS "${AUTH[@]}" "$API/repos/$REPO/releases/$REL_ID" \
     | python3 -c 'import json,sys
 d=json.load(sys.stdin)
-print(f"        release {d[\"tag_name\"]}  draft={d[\"draft\"]}  assets={len(d[\"assets\"])}")
-for a in d["assets"]: print(f"        - {a[\"name\"]}  {a[\"size\"]} B  {a.get(\"digest\") or \"\"}")'
+print("        release " + d["tag_name"] + "  draft=" + str(d["draft"]) + "  assets=" + str(len(d["assets"])))
+for a in d["assets"]:
+    print("        - " + a["name"] + "  " + str(a["size"]) + " B  " + str(a.get("digest") or ""))'
   echo
   say "完成：https://github.com/$REPO/releases/tag/$TAG"
 fi
