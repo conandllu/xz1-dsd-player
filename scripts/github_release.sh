@@ -39,6 +39,33 @@ ASSETS=(
 
 say() { echo "[release] $*"; }
 
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+# 调 API：$1=描述 $2=方法 $3=url，其余参数透传给 curl；非 2xx 打印 GitHub 的 message 后退出
+api() {
+  local what=$1 method=$2 url=$3; shift 3
+  local body="$WORK/body" code
+  code=$(curl -sS -o "$body" -w '%{http_code}' -X "$method" "${AUTH[@]}" "$@" "$url" || echo 000)
+  if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+    echo "✗ $what 失败（HTTP $code）" >&2
+    python3 -c 'import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    print("  " + str(d.get("message","")))
+    for e in d.get("errors",[]) or []: print("  -", e)
+except Exception:
+    print(open(sys.argv[1]).read()[:300])' "$body" >&2
+    case "$code" in
+      401) echo "  提示：token 无效或过期（~/.github_token）" >&2 ;;
+      403) echo "  提示：token 权限不足 —— fine-grained PAT 需要 Repository permissions → Contents: Read and write" >&2 ;;
+      404) echo "  提示：仓库不存在，或 token 未被授权访问该仓库" >&2 ;;
+    esac
+    exit 1
+  fi
+  cat "$body"
+}
+
 for a in "${ASSETS[@]}"; do
   f=${a%%:*}
   [ -f "$f" ] || { echo "✗ 缺少构建产物：$f（先跑 ./gradlew assembleDsdRelease assembleCompanionRelease）" >&2; exit 1; }
@@ -60,9 +87,9 @@ if [ -z "${REL_ID:-}" ]; then
   say "创建 release $TAG"
   if [ "$DRY_RUN" = "1" ]; then echo "  (dry-run) POST $API/repos/$REPO/releases"; REL_ID=0; else
     BODY=$(python3 -c 'import json,sys; print(json.dumps({"tag_name":sys.argv[1],"name":sys.argv[2],"body":open(sys.argv[3]).read(),"target_commitish":"main","draft":False,"prerelease":False}))' "$TAG" "$NAME" "$NOTES")
-    REL_ID=$(curl -fsS "${AUTH[@]}" -H "Content-Type: application/json" -d "$BODY" \
-             "$API/repos/$REPO/releases" \
-             | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["id"])')
+    RESP=$(api "创建 release" POST "$API/repos/$REPO/releases" \
+           -H "Content-Type: application/json" -d "$BODY")
+    REL_ID=$(printf '%s' "$RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
     say "release id=$REL_ID"
   fi
 else
@@ -83,11 +110,9 @@ for a in json.load(sys.stdin):
     curl -fsS -X DELETE "${AUTH[@]}" "$API/repos/$REPO/releases/assets/$OLD" >/dev/null || true
   fi
   say "上传 $n ($(stat -c%s "$f") B)…"
-  curl -fsS -X POST "${AUTH[@]}" \
-    -H "Content-Type: application/vnd.android.package-archive" \
-    --data-binary @"$f" \
-    "https://uploads.github.com/repos/$REPO/releases/$REL_ID/assets?name=$n" \
-    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"        → {d[\"name\"]}  {d[\"size\"]} B  state={d[\"state\"]}")'
+  RESP=$(api "上传 $n" POST "https://uploads.github.com/repos/$REPO/releases/$REL_ID/assets?name=$n" \
+         -H "Content-Type: application/vnd.android.package-archive" --data-binary @"$f")
+  printf '%s' "$RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"        → {d[\"name\"]}  {d[\"size\"]} B  state={d[\"state\"]}")'
 done
 
 # 3) 回读校验
