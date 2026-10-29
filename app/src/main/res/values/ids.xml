@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 程序化创建的在线专辑详情头/提示行，需要一个稳定的 id 供 bind 时 findViewById 使用 -->
+<resources>
+    <item name="headCover" type="id" />
+    <item name="headTitle" type="id" />
+    <item name="headSub" type="id" />
+    <item name="headMeta" type="id" />
+    <item name="noteText" type="id" />
+</resources>

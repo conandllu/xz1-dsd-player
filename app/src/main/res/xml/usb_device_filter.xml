@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 匹配任何 USB 音频类设备（Audio class 0x01），插 DAC 即弹打开/授权框 -->
+<resources>
+    <usb-device class="1" />
+</resources>

@@ -1,0 +1,13 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- 顺序播放：一条向前的箭头（播完最后一首就停，不回绕） -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M4,11v2h12.5l-3.5,3.5l1.41,1.41L20.33,12l-5.92,-6.0L13,7.5L16.5,11H4z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M20,5h2v14h-2z" />
+</vector>

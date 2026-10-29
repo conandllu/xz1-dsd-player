@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- CoverImageView：圆角 / 淡化叠色 / 描边（默认值写在自定义 View 里） -->
+    <declare-styleable name="CoverImageView">
+        <attr name="radiusDp" format="float" />
+        <attr name="coverScrim" format="color" />
+        <attr name="coverBorder" format="color" />
+    </declare-styleable>
+</resources>

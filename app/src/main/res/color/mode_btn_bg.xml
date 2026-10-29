@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 输出模式分段控件：选中用主色实底（走查 #24 —— 原来 Material3 默认灰底对比太低） -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_checked="true" android:color="#FF5B8DEF" />
+    <item android:color="#1FFFFFFF" />
+</selector>

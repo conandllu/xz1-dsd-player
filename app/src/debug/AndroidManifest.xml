@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- debug 专用覆盖：把 PlaybackService 导出，方便用 adb 直接触发自检/调试命令。
+     release 构建不包含这个文件，服务保持 exported=false。 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application>
+        <service
+            android:name=".playback.PlaybackService"
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback"
+            tools:replace="android:exported"
+            tools:ignore="ExportedService" />
+    </application>
+</manifest>

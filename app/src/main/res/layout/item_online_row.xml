@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 在线曲目行：设计语言与本地 item_track_row 完全一致（标题/副标题分行、时长右对齐），
+     区别只是这里显示 46dp 圆角封面（本地歌曲列表按用户要求不显示封面）。 -->
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="?attr/selectableItemBackground"
+    android:clickable="true"
+    android:focusable="true"
+    android:minHeight="56dp"
+    android:paddingHorizontal="12dp"
+    android:paddingVertical="5dp">
+
+    <com.dsd.player.ui.CoverImageView
+        android:id="@+id/cover"
+        android:layout_width="46dp"
+        android:layout_height="46dp"
+        android:background="@drawable/bg_cover_placeholder"
+        android:contentDescription="@string/artwork"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:radiusDp="8" />
+
+    <TextView
+        android:id="@+id/title"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:ellipsize="end"
+        android:singleLine="true"
+        android:textColor="#FFFFFFFF"
+        android:textSize="14sp"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintStart_toEndOf="@id/cover"
+        app:layout_constraintEnd_toStartOf="@id/favBtn" />
+
+    <TextView
+        android:id="@+id/subtitle"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:ellipsize="end"
+        android:singleLine="true"
+        android:textColor="#99FFFFFF"
+        android:textSize="11sp"
+        app:layout_constraintTop_toBottomOf="@id/title"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toEndOf="@id/cover"
+        app:layout_constraintEnd_toStartOf="@id/favBtn" />
+
+    <ImageView
+        android:id="@+id/favBtn"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:layout_marginEnd="4dp"
+        android:background="?attr/selectableItemBackgroundBorderless"
+        android:contentDescription="收藏"
+        android:padding="11dp"
+        android:src="@drawable/ic_star_outline"
+        android:visibility="gone"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toStartOf="@id/trailing"
+        app:tint="#66FFFFFF" />
+
+    <TextView
+        android:id="@+id/trailing"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="8dp"
+        android:textColor="#99FFFFFF"
+        android:textSize="11sp"
+        app:layout_constraintBaseline_toBaselineOf="@id/title"
+        app:layout_constraintEnd_toEndOf="parent" />
+</androidx.constraintlayout.widget.ConstraintLayout>

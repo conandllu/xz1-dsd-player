@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 迷你播放器：半透明圆角卡片（参考 RawS 的液态玻璃观感，用纯色+描边近似） -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#CC1F2A33" />
+    <corners android:radius="22dp" />
+    <stroke android:width="1dp" android:color="#33FFFFFF" />
+</shape>

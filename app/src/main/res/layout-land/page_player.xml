@@ -1,0 +1,207 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 横屏播放页：左半屏正方形封面 + 右半屏控制区（走查 L1 —— 竖屏 Column 在横屏被裁到只剩封面） -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="horizontal"
+    android:paddingHorizontal="14dp"
+    android:paddingVertical="8dp">
+
+    <!-- 左：封面容器（正方形由 PlayerPage.fitCover 按可用高度计算） -->
+    <FrameLayout
+        android:id="@+id/coverBox"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:paddingEnd="10dp">
+
+        <com.dsd.player.ui.CoverImageView
+            android:id="@+id/cover"
+            app:radiusDp="16"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_gravity="center"
+            android:background="@drawable/bg_cover_placeholder"
+            android:contentDescription="@string/artwork"
+            android:scaleType="centerCrop" />
+    </FrameLayout>
+
+    <!-- 右：曲目信息 + 进度 + 主控 + DAC 摘要 -->
+    <ScrollView
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:fillViewport="true"
+        android:scrollbars="none">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingStart="10dp">
+
+            <TextView
+                android:id="@+id/title"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxLines="2"
+                android:text="@string/nothing_playing"
+                android:textColor="#FFFFFFFF"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/subtitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:ellipsize="end"
+                android:singleLine="true"
+                android:textColor="#99FFFFFF"
+                android:textSize="12sp" />
+
+            <com.dsd.player.ui.SeekLineView
+                android:id="@+id/seek"
+                android:layout_width="match_parent"
+                android:layout_height="40dp" />
+
+            <LinearLayout
+                android:id="@+id/timeRow"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:id="@+id/pos"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="0:00"
+                    android:textColor="#99FFFFFF"
+                    android:textSize="11sp" />
+
+                <TextView
+                    android:id="@+id/dur"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="0:00"
+                    android:textColor="#99FFFFFF"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <androidx.constraintlayout.widget.ConstraintLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp">
+
+                    <ImageView
+                    android:id="@+id/btnRepeat"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/repeat_mode"
+                    android:padding="9dp"
+                    android:src="@drawable/ic_repeat_order"
+                    app:tint="#CCFFFFFF"
+                    app:layout_constraintTop_toTopOf="@id/btnPlay"
+                    app:layout_constraintBottom_toBottomOf="@id/btnPlay"
+                    app:layout_constraintStart_toStartOf="parent" />
+
+                <ImageView
+                    android:id="@+id/btnPlay"
+                    android:layout_width="60dp"
+                    android:layout_height="60dp"
+                    android:background="@drawable/bg_play_circle"
+                    android:contentDescription="@string/play"
+                    android:padding="17dp"
+                    android:src="@drawable/ic_play"
+                    app:tint="#FFFFFF"
+                    app:layout_constraintTop_toTopOf="parent"
+                    app:layout_constraintBottom_toBottomOf="parent"
+                    app:layout_constraintStart_toStartOf="parent"
+                    app:layout_constraintEnd_toEndOf="parent" />
+
+                <ImageView
+                    android:id="@+id/btnPrev"
+                    android:layout_width="50dp"
+                    android:layout_height="50dp"
+                    android:layout_marginEnd="8dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/prev"
+                    android:padding="14dp"
+                    android:src="@drawable/ic_prev"
+                    app:tint="#FFFFFF"
+                    app:layout_constraintTop_toTopOf="@id/btnPlay"
+                    app:layout_constraintBottom_toBottomOf="@id/btnPlay"
+                    app:layout_constraintEnd_toStartOf="@id/btnPlay" />
+
+                <ImageView
+                    android:id="@+id/btnNext"
+                    android:layout_width="50dp"
+                    android:layout_height="50dp"
+                    android:layout_marginStart="8dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/next"
+                    android:padding="14dp"
+                    android:src="@drawable/ic_next"
+                    app:tint="#FFFFFF"
+                    app:layout_constraintTop_toTopOf="@id/btnPlay"
+                    app:layout_constraintBottom_toBottomOf="@id/btnPlay"
+                    app:layout_constraintStart_toEndOf="@id/btnPlay" />
+
+                <ImageView
+                    android:id="@+id/btnStop"
+                    android:layout_marginStart="4dp"
+                    android:layout_width="38dp"
+                    android:layout_height="38dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/stop"
+                    android:padding="10dp"
+                    android:src="@drawable/ic_stop"
+                    app:tint="#66FFFFFF"
+                    app:layout_constraintTop_toTopOf="@id/btnPlay"
+                    app:layout_constraintBottom_toBottomOf="@id/btnPlay"
+                    app:layout_constraintStart_toEndOf="@id/btnNext" />
+            </androidx.constraintlayout.widget.ConstraintLayout>
+
+            <TextView
+                android:id="@+id/queueInfo"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:paddingVertical="2dp"
+                android:textColor="#80FFFFFF"
+                android:textSize="11sp" />
+
+            <LinearLayout
+                android:id="@+id/dacCard"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:background="@drawable/bg_mini_player"
+                android:clickable="true"
+                android:focusable="true"
+                android:orientation="vertical"
+                android:padding="10dp">
+
+                <TextView
+                    android:id="@+id/dacTitle"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/no_device"
+                    android:textColor="#FFFFFFFF"
+                    android:textSize="12sp" />
+
+                <TextView
+                    android:id="@+id/dacCaps"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:textColor="#99FFFFFF"
+                    android:textSize="11sp" />
+            </LinearLayout>
+        </LinearLayout>
+    </ScrollView>
+</LinearLayout>

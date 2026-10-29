@@ -1,0 +1,190 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true"
+    android:scrollbars="none">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:gravity="center_horizontal|center_vertical"
+        android:orientation="vertical"
+        android:paddingHorizontal="18dp"
+        android:paddingVertical="8dp">
+
+        <com.dsd.player.ui.CoverImageView
+            android:id="@+id/cover"
+            app:radiusDp="16"
+            android:layout_width="match_parent"
+            android:layout_height="260dp"
+            android:layout_marginTop="2dp"
+            android:background="@drawable/bg_cover_placeholder"
+            android:contentDescription="@string/artwork" />
+
+        <TextView
+            android:id="@+id/title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:ellipsize="end"
+            android:maxLines="2"
+            android:text="@string/nothing_playing"
+            android:textColor="#FFFFFFFF"
+            android:textSize="19sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/subtitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:ellipsize="end"
+            android:singleLine="true"
+            android:textColor="#99FFFFFF"
+            android:textSize="13sp" />
+
+        <com.dsd.player.ui.SeekLineView
+            android:id="@+id/seek"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginTop="2dp" />
+
+        <LinearLayout
+            android:id="@+id/timeRow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/pos"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="0:00"
+                android:textColor="#99FFFFFF"
+                android:textSize="11sp" />
+
+            <TextView
+                android:id="@+id/dur"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="0:00"
+                android:textColor="#99FFFFFF"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <androidx.constraintlayout.widget.ConstraintLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp">
+
+            <ImageView
+                android:id="@+id/btnRepeat"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/repeat_mode"
+                android:padding="9dp"
+                android:src="@drawable/ic_repeat_order"
+                app:tint="#CCFFFFFF"
+                app:layout_constraintTop_toTopOf="@id/btnPlay"
+                app:layout_constraintBottom_toBottomOf="@id/btnPlay"
+                app:layout_constraintStart_toStartOf="parent" />
+
+            <ImageView
+                android:id="@+id/btnPlay"
+                android:layout_width="64dp"
+                android:layout_height="64dp"
+                android:background="@drawable/bg_play_circle"
+                android:contentDescription="@string/play"
+                android:padding="18dp"
+                android:src="@drawable/ic_play"
+                app:tint="#FFFFFF"
+                app:layout_constraintTop_toTopOf="parent"
+                app:layout_constraintBottom_toBottomOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintEnd_toEndOf="parent" />
+
+            <ImageView
+                android:id="@+id/btnPrev"
+                android:layout_width="52dp"
+                android:layout_height="52dp"
+                android:layout_marginEnd="10dp"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/prev"
+                android:padding="13dp"
+                android:src="@drawable/ic_prev"
+                app:tint="#FFFFFF"
+                app:layout_constraintTop_toTopOf="@id/btnPlay"
+                app:layout_constraintBottom_toBottomOf="@id/btnPlay"
+                app:layout_constraintEnd_toStartOf="@id/btnPlay" />
+
+            <ImageView
+                android:id="@+id/btnNext"
+                android:layout_width="52dp"
+                android:layout_height="52dp"
+                android:layout_marginStart="10dp"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/next"
+                android:padding="13dp"
+                android:src="@drawable/ic_next"
+                app:tint="#FFFFFF"
+                app:layout_constraintTop_toTopOf="@id/btnPlay"
+                app:layout_constraintBottom_toBottomOf="@id/btnPlay"
+                app:layout_constraintStart_toEndOf="@id/btnPlay" />
+
+            <ImageView
+                android:id="@+id/btnStop"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:layout_marginStart="4dp"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/stop"
+                android:padding="11dp"
+                android:src="@drawable/ic_stop"
+                app:tint="#66FFFFFF"
+                app:layout_constraintTop_toTopOf="@id/btnPlay"
+                app:layout_constraintBottom_toBottomOf="@id/btnPlay"
+                app:layout_constraintStart_toEndOf="@id/btnNext" />
+        </androidx.constraintlayout.widget.ConstraintLayout>
+
+        <TextView
+            android:id="@+id/queueInfo"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:gravity="center"
+            android:textColor="#80FFFFFF"
+            android:textSize="11sp" />
+
+        <LinearLayout
+            android:id="@+id/dacCard"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_mini_player"
+            android:clickable="true"
+            android:focusable="true"
+            android:orientation="vertical"
+            android:padding="12dp">
+
+            <TextView
+                android:id="@+id/dacTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/no_device"
+                android:textColor="#FFFFFFFF"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/dacCaps"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:textColor="#99FFFFFF"
+                android:textSize="11sp" />
+        </LinearLayout>
+    </LinearLayout>
+</ScrollView>

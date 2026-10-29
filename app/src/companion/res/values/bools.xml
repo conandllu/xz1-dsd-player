@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- companion 分支：默认「暂停/停止即让出 USB 独占」，方便官方 Apple Music 接管 DAC -->
+    <bool name="handoff_default">true</bool>
+</resources>

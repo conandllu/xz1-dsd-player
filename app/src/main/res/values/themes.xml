@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.DsdPlayer" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="android:statusBarColor">#0B1218</item>
+        <item name="android:navigationBarColor">#0B1218</item>
+        <item name="android:windowLightStatusBar" tools:targetApi="m">false</item>
+    </style>
+    <!-- 底部面板弹出/收起动画（从屏幕下方滑入） -->
+    <style name="SheetAnim" parent="android:Animation">
+        <item name="android:windowEnterAnimation">@anim/sheet_in</item>
+        <item name="android:windowExitAnimation">@anim/sheet_out</item>
+    </style>
+
+    <color name="ic_launcher_bg">#1B2A4A</color>
+</resources>

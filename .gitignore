@@ -1,0 +1,35 @@
+# ---- Android / Gradle 构建产物 ----
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+build/
+app/build/
+.gradle/
+.cxx/
+app/.cxx/
+local.properties
+captures/
+.externalNativeBuild/
+
+# ---- IDE ----
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# ---- 签名与密钥（绝对不要提交）----
+*.jks
+*.keystore
+keystore.properties
+signing/
+
+# ---- 内部调试/协作材料（不进开源仓库）----
+dsd-player-debug.md
+dsd-player-debug.md.new
+ui-review.md
+ui-layout-review.md
+usb-charge-splitter.md
+scripts/push_report.py
+docs/internal/

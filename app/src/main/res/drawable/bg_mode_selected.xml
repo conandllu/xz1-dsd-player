@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 分段控件选中段：胶囊（圆角 = 高度一半），外圈仍由容器 bg_mode_group 裁切 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#FF5B8DEF" />
+    <corners android:radius="19dp" />
+</shape>

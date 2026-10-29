@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  输出模式分段控件的外框：圆角 + 1dp 描边挂在**容器**上，子按钮不再各画描边。
+  之前每个 MaterialButton 自带 1dp stroke + cornerRadius=19dp，被 toggleGroup 裁剪后
+  第一段（自动）左边会露出一小截弧线，看起来就是"自动前面有个 |"。
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#1FFFFFFF" />
+    <corners android:radius="19dp" />
+    <stroke android:width="1dp" android:color="#33FFFFFF" />
+</shape>

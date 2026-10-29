@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 小圆点滑块（原来 Material3 的大竖条 thumb 太粗） -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+    <solid android:color="#5B8DEF" />
+    <size android:width="12dp" android:height="12dp" />
+</shape>

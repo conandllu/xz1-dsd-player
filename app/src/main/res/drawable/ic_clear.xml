@@ -1,0 +1,10 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- 清除：圆形底 + 白叉 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M12,2C6.48,2 2,6.48 2,12s4.48,10 10,10s10,-4.48 10,-10S17.52,2 12,2zM16.24,16.24L12,12.41l-4.24,3.83l-1.41,-1.41L10.59,12L6.35,8.17l1.41,-1.41L12,10.59l4.24,-3.83l1.41,1.41L13.41,12l4.24,3.83L16.24,16.24z" />
+</vector>

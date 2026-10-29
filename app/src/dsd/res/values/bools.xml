@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- dsd（原版）分支：默认不主动让出 USB，行为与之前一致 -->
+    <bool name="handoff_default">false</bool>
+</resources>
