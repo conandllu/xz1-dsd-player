@@ -1340,11 +1340,19 @@ class PlayerPage(private val act: MainActivity, parent: FrameLayout) {
         val parent = cover.parent as? android.view.ViewGroup ?: return
         val rootH = root.height
         if (rootH <= 0) return
+        // 其它控件的高度必须用**自然高度**：封面变大会挤扁它们，用当前 height 求和会偏小
+        // （720p 上就因此把封面算大 100 多像素，DAC 卡被挤到可视区外）。
+        val widthSpec = View.MeasureSpec.makeMeasureSpec(
+            (parent.width - parent.paddingLeft - parent.paddingRight).coerceAtLeast(1),
+            View.MeasureSpec.AT_MOST)
+        val unspo = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
         var others = 0
         for (i in 0 until parent.childCount) {
             val c = parent.getChildAt(i)
             if (c === cover || c.visibility == View.GONE) continue
-            others += c.height
+            c.measure(widthSpec, unspo)
+            val lp = c.layoutParams as? android.view.ViewGroup.MarginLayoutParams
+            others += c.measuredHeight + (lp?.topMargin ?: 0) + (lp?.bottomMargin ?: 0)
         }
         val availW = parent.width - parent.paddingLeft - parent.paddingRight
         val availH = rootH - others - parent.paddingTop - parent.paddingBottom - (8 * d0).toInt()

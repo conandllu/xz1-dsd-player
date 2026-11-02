@@ -86,12 +86,32 @@ object Library {
     /** 目录名 "Artist - Album" → (artist, album)；无该形态返回 null */
     fun splitFolderName(folder: String): Pair<String, String>? {
         val name = folder.substringAfterLast('/').ifBlank { return null }
+        // 分隔符不能出现在括号里：`[Hi-Res]Test Album` 里的 "-" 不是"艺术家 - 专辑"的分隔符，
+        // 否则会被切成 artist="[Hi"、album="Res]Test Album"（720p 走查里那个怪名字）
+        fun insideBracket(idx: Int): Boolean {
+            var sq = 0
+            var paren = 0
+            for (i in 0 until idx) {
+                when (name[i]) {
+                    '[', '【', '〔' -> sq++
+                    '(', '（' -> paren++
+                    ']', '】', '〕' -> if (sq > 0) sq--
+                    ')', '）' -> if (paren > 0) paren--
+                }
+            }
+            return sq > 0 || paren > 0
+        }
         for (sep in listOf(" - ", " – ", " — ", "-")) {
-            val i = name.indexOf(sep)
-            if (i > 2 && i < name.length - sep.length - 1) {
-                val a = name.substring(0, i).trim()
-                val b = name.substring(i + sep.length).trim()
-                if (a.isNotEmpty() && b.isNotEmpty()) return a to b
+            var from = 0
+            while (true) {
+                val i = name.indexOf(sep, from)
+                if (i < 0) break
+                if (!insideBracket(i) && i > 2 && i < name.length - sep.length - 1) {
+                    val a = name.substring(0, i).trim()
+                    val b = name.substring(i + sep.length).trim()
+                    if (a.isNotEmpty() && b.isNotEmpty()) return a to b
+                }
+                from = i + 1
             }
         }
         return null

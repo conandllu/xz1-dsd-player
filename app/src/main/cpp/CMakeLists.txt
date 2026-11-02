@@ -34,6 +34,15 @@ target_include_directories(dsdplayer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}          # 让 native/alac_jni.cpp 能 #include "alac/..."
 )
 
+# ── 16 KB 页对齐 ───────────────────────────────────────────────────────
+# Android 15 起出现 16 KB 页内核设备（Pixel/部分 ROM），未对齐的 .so 在这些机器上直接
+# 加载失败；Google Play 从 2025-11 起对 targetSdk≥35 的应用强制要求。
+# NDK r28+ 默认 max-page-size=16384；r27 及以下必须显式指定。
+# 自查：llvm-readelf -l libdsdplayer.so | grep LOAD  → Align 应为 0x4000
+target_link_options(dsdplayer PRIVATE
+    "-Wl,-z,max-page-size=16384"
+    "-Wl,-z,common-page-size=16384")
+
 find_library(log-lib log)
 find_library(android-lib android)
 target_link_libraries(dsdplayer libusb alac ${log-lib} ${android-lib})

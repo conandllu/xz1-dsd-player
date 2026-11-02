@@ -98,3 +98,21 @@ adb logcat -s PlaybackService FlacSource FlacFloat HttpFlac StreamByteSource Mp4
 
 模拟器没有 DAC 也能看关键日志：`精确解码：请求 FLOAT 输出`、`解码输出 encoding=4(float)`、
 `吞吐：…×实时`、`解码自检：… 比例 ≈1.00`。
+
+## 9. 小屏 / 新系统适配（720p、16 KB 页）
+
+- **16 KB 页对齐**：Android 15+ 出现 16 KB 内核设备，未对齐的 `.so` 会加载失败（当前 4 KB 设备只弹
+  警告："此应用不符合 16 KB 对齐要求"）。NDK r27 及以下必须在链接阶段加
+  `-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384`（`app/src/main/cpp/CMakeLists.txt`），
+  NDK r28+ 默认就是。
+  自查两条：`llvm-readelf -l libdsdplayer.so | grep LOAD` → Align 必须 `0x4000`；
+  `zipalign -c -P 16 -v 4 app.apk` 必须 "Verification succesful"。
+- **播放页封面算大小别用兄弟控件的当前 height**：封面一变大就会把兄弟挤扁，用"当前 height"求和
+  会偏小 → 封面越算越大，最后把 DAC 卡片挤到可视区外（720p 上 `dacCaps` 只剩 9px）。
+  正确做法：对每个兄弟控件 `measure(AT_MOST(width), UNSPECIFIED)` 取**自然高度**再加 margin。
+- **ScrollView/NestedScrollView 里直接子项别用 `match_parent` 高度**：会被夹到视口高度，
+  `wrap_content` 才让内容自然增长并可滚动（`page_player.xml` 曾因此挤压最底部卡片）。
+- **目录名切分要跳过括号内的分隔符**：`[Hi-Res]Test Album` 里的 `-` 不是"艺术家 - 专辑"的分隔符，
+  否则会切成 artist=`[Hi` / album=`Res]Test Album`（显示成 `Res]Test Album [Hi`）。
+- 验证小屏不用真机：`adb shell wm size 720x1280 && adb shell wm density 320` 复现 720p 几何，
+  用 `uiautomator dump` 读控件 bounds 判断有没有被裁（比肉眼靠谱）。
