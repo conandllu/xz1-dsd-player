@@ -29,49 +29,37 @@ class HttpFlacSource(
     private var format: MediaFormat? = null
     private var mime: String = MediaFormat.MIMETYPE_AUDIO_FLAC
 
+    /** 非 null = 标准 FLAC 流，走"自研切帧 + float 解码"，**完全不碰 MediaExtractor** */
+    private var flacInfo: FlacInfo? = null
+
+    /** 已打开的字节流（需要显式关闭） */
+    private var floatBs: ByteSource? = null
+
     override val info: AudioInfo
 
     init {
         try {
             val ds = HttpMediaDataSource(url, headers = headers)
-            val ex = MediaExtractor()
-            ex.setDataSource(ds)
-            var pick = -1
-            var pickFmt: MediaFormat? = null
-            for (i in 0 until ex.trackCount) {
-                val f = ex.getTrackFormat(i)
-                val m = f.getString(MediaFormat.KEY_MIME) ?: continue
-                if (!m.startsWith("audio/")) continue
-                pick = i; pickFmt = f; break
-            }
-            if (pick < 0 || pickFmt == null) error("流里没有音频轨道（不是 FLAC？）")
-            ex.selectTrack(pick)
             dataSource = ds
-            extractor = ex
-            format = pickFmt
-            mime = pickFmt.getString(MediaFormat.KEY_MIME) ?: MediaFormat.MIMETYPE_AUDIO_FLAC
-            val rate = if (pickFmt.containsKey(MediaFormat.KEY_SAMPLE_RATE))
-                pickFmt.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 44100
-            val ch = if (pickFmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT))
-                pickFmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 2
-            // FLAC 的位深在 STREAMINFO 里，MediaFormat 一般不给 → 默认 16，解码器输出会纠正
-            val bits = if (pickFmt.containsKey("bits-per-sample"))
-                pickFmt.getInteger("bits-per-sample") else 16
-            val durUs = if (pickFmt.containsKey(MediaFormat.KEY_DURATION))
-                pickFmt.getLong(MediaFormat.KEY_DURATION) else 0L
-            info = AudioInfo(
-                container = "FLAC(stream)", sampleRate = rate, channels = ch,
-                bitsPerSample = bits, isDsd = false, dsdRateHz = 0, dsdLsbFirst = false,
-                durationUs = durUs,
-            )
-            runCatching {
-                // 只读 4 字节确认确实是 fLaC（顺带验证 Range 数据源在开流阶段可用）
-                val head = ByteArray(4)
-                val n = ds.readAt(0, head, 0, 4)
-                Log.i(TAG, "头部魔数=" + String(head, 0, maxOf(n, 0), Charsets.US_ASCII))
+            val head = ByteArray(4)
+            val n = runCatching { ds.readAt(0, head, 0, 4) }.getOrDefault(-1)
+            val magic = if (n == 4) String(head, Charsets.US_ASCII) else "?"
+            if (magic == "fLaC") {
+                // 标准 FLAC：只读 STREAMINFO 就够（位深/声道/采样率/总样本都在里面）。
+                // 以前这里用 MediaExtractor 探测，会让平台 FLACDecoder 对着"不完整的探测数据"
+                // 报一串 `no streaminfo metadata block`，还会白解一遍（真机日志噪音来源）。
+                val fi = FlacFrameReader(DsRandomSource(ds)).use { it.info }
+                flacInfo = fi
+                info = AudioInfo(
+                    container = "FLAC(stream)", sampleRate = fi.rate, channels = fi.channels,
+                    bitsPerSample = fi.bits, isDsd = false, dsdRateHz = 0, dsdLsbFirst = false,
+                    durationUs = if (fi.rate > 0) fi.totalSamples * 1_000_000L / fi.rate else 0L,
+                )
+                Log.i(TAG, "FLAC 流（自研切帧，跳过 MediaExtractor）：${fi.rate}Hz ${fi.channels}ch " +
+                    "${fi.bits}bit dur=${info.durationUs / 1000}ms size=${ds.getSize() / 1024}KB")
+            } else {
+                info = initExtractor(ds, magic)
             }
-            Log.i(TAG, "打开流: mime=$mime ${rate}Hz ${ch}ch ${bits}bit " +
-                "dur=${durUs / 1000}ms size=${ds.getSize() / 1024}KB csd0=${pickFmt.containsKey("csd-0")}")
         } catch (e: Throwable) {
             runCatching { extractor?.release() }
             runCatching { dataSource?.close() }
@@ -79,32 +67,71 @@ class HttpFlacSource(
         }
     }
 
-    /** 已打开的「精确 24bit」字节流（需要显式关闭） */
-    private var floatBs: ByteSource? = null
-
-    override fun openPcm(): ByteSource {
-        // 24bit 源优先走自研切帧 + float 解码（拿真 24bit）；失败则回退平台解码（可能只有 16bit）
-        if (info.bitsPerSample > 16 && info.container.startsWith("FLAC")) {
-            runCatching { floatBs?.close() }
-            floatBs = null
-            runCatching { openFloat() }.onSuccess { return it }
-                .onFailure { Log.w(TAG, "精确 24bit 路径失败，回退平台解码：${it.message}") }
+    /**
+     * 非 FLAC（m4a/aac 等）或魔数异常时的老路径：MediaExtractor 探轨道 + MediaCodec 解码。
+     * 标准 FLAC 流不会走到这里；自研路径失败时也会回退到这里（见 [openPcm]）。
+     */
+    private fun initExtractor(ds: HttpMediaDataSource, magic: String): AudioInfo {
+        val ex = MediaExtractor()
+        ex.setDataSource(ds)
+        var pick = -1
+        var pickFmt: MediaFormat? = null
+        for (i in 0 until ex.trackCount) {
+            val f = ex.getTrackFormat(i)
+            val m = f.getString(MediaFormat.KEY_MIME) ?: continue
+            if (!m.startsWith("audio/")) continue
+            pick = i; pickFmt = f; break
         }
-        return StreamByteSource(extractor ?: error("流已关闭"), format!!, info, mime)
+        if (pick < 0 || pickFmt == null) error("流里没有音频轨道（不是 FLAC？）")
+        ex.selectTrack(pick)
+        extractor = ex
+        format = pickFmt
+        mime = pickFmt.getString(MediaFormat.KEY_MIME) ?: MediaFormat.MIMETYPE_AUDIO_FLAC
+        val rate = if (pickFmt.containsKey(MediaFormat.KEY_SAMPLE_RATE))
+            pickFmt.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 44100
+        val ch = if (pickFmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT))
+            pickFmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 2
+        // FLAC 的位深在 STREAMINFO 里，MediaFormat 一般不给 → 默认 16，解码器输出会纠正
+        val bits = if (pickFmt.containsKey("bits-per-sample"))
+            pickFmt.getInteger("bits-per-sample") else 16
+        val durUs = if (pickFmt.containsKey(MediaFormat.KEY_DURATION))
+            pickFmt.getLong(MediaFormat.KEY_DURATION) else 0L
+        Log.i(TAG, "头部魔数=$magic → 走 MediaExtractor：mime=$mime ${rate}Hz ${ch}ch ${bits}bit " +
+            "dur=${durUs / 1000}ms size=${ds.getSize() / 1024}KB csd0=${pickFmt.containsKey("csd-0")}")
+        return AudioInfo(
+            container = "FLAC(stream)", sampleRate = rate, channels = ch,
+            bitsPerSample = bits, isDsd = false, dsdRateHz = 0, dsdLsbFirst = false,
+            durationUs = durUs,
+        )
     }
 
-    /**
-     * 真 24bit：用同一个 Range 数据源自己切 FLAC 帧，喂平台解码器并要求 float 输出。
-     * 平台 extractor 会把 24bit 降成 16bit（`pcmBytes=2 extractor报=24bit`），绕不过去。
-     */
-    private fun openFloat(): ByteSource {
-        val rs = DsRandomSource(dataSource ?: error("数据源已关闭"))
-        val r = FlacFrameReader(rs)         // 不是 fLaC 会抛异常 → 上层回退
-        require(r.info.bits > 16) { "源位深 ${r.info.bits}bit，不需要精确路径" }
-        val bs = FlacFloatByteSource(r, rs, TAG)
+    override fun openPcm(): ByteSource {
+        val ds = dataSource
+        // 标准 FLAC：**任何位深**都走自研切帧 + float 解码
+        //  - 24bit：唯一能拿到真 24bit 的办法（平台 extractor 会降到 16bit）
+        //  - 16bit：float 解码后缩放到 24-in-32，低 8 位为 0，与以前 upsample16 的结果一致
+        if (ds != null && flacInfo != null) {
+            runCatching { floatBs?.close() }
+            floatBs = null
+            runCatching { openFlac(ds) }.onSuccess { return it }
+                .onFailure { Log.w(TAG, "自研 FLAC 路径失败，回退 MediaExtractor：${it.message}") }
+        }
+        return try {
+            if (extractor == null && ds != null) initExtractor(ds, "fallback")   // 只为建立 extractor
+            StreamByteSource(extractor ?: error("流已关闭"), format!!, info, mime)
+        } catch (t: Throwable) {
+            throw IllegalStateException("网络 FLAC 打开失败：${t.message}", t)
+        }
+    }
+
+    /** 自研切帧 → 平台解码器（要求 float 输出）→ 24-in-32 */
+    private fun openFlac(ds: HttpMediaDataSource): ByteSource {
+        val rs = DsRandomSource(ds)
+        val r = FlacFrameReader(rs)
+        val bs = FlacFloatByteSource(r, DsRandomSource(ds), TAG)
         floatBs = bs
-        Log.i(TAG, "精确 24bit 解码：源 ${r.info.bits}bit ${r.info.rate}Hz ${r.info.channels}ch " +
-            "总样本 ${r.info.totalSamples}")
+        Log.i(TAG, "自研 FLAC 解码：源 ${r.info.bits}bit ${r.info.rate}Hz ${r.info.channels}ch " +
+            "总样本 ${r.info.totalSamples}（float 输出 → 24-in-32）")
         return bs
     }
 

@@ -46,6 +46,10 @@
   4 MB 环被抽干 → 泵欠载 → "滋啦"。有了预读窗口，解码线程基本都命中缓存。
 - 数据源短读（部分数据）不要当失败立即返回：要带退避重试几次并保留已取到的部分，
   否则外层 1 ms 后重试会变成高频碎读。
+- **标准 FLAC 流不要用 MediaExtractor 探测**：只要文件头是 `fLaC`，位深/声道/采样率/总样本
+  都能从 STREAMINFO 直接读（`FlacFrameReader`）。用 extractor 探测会让平台 FLACDecoder 对着
+  不完整的探测数据报一串 `no streaminfo metadata block`，而且会白解一遍（起播更慢、更费电）。
+  现在：`fLaC` → 自研切帧（任何位深都走 float 输出）；其他容器（m4a/aac 等）才走 extractor。
 - 供数日志：`Producer` 每 10 s 一行 `供数：…×实时 + underrun 增量 + ring 最低水位`（debug 构建）。
 
 ## 4. 解码与位深（最容易翻车的部分）
