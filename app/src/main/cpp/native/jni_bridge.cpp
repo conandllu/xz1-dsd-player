@@ -123,6 +123,9 @@ Java_com_dsd_player_usb_NativeBridge_nativePumpRunning(JNIEnv*, jobject) {
 }
 JNIEXPORT void JNICALL
 Java_com_dsd_player_usb_NativeBridge_nativeRingReset(JNIEnv*, jobject) { usbaudio::ring_reset(); }
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dsd_player_usb_NativeBridge_nativeResetStats(JNIEnv*, jobject) { usbaudio::reset_stats(); }
 JNIEXPORT jint JNICALL
 Java_com_dsd_player_usb_NativeBridge_nativeRingFree(JNIEnv*, jobject) { return usbaudio::ring_free(); }
 JNIEXPORT jint JNICALL

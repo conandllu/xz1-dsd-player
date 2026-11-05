@@ -51,10 +51,14 @@ class FlacFloatByteSource(
          *  喂解码器：实测非帧对齐的块会丢样本（喂整份只吐出 42%）。 */
         private const val READ_CHUNK = 2 * 1024 * 1024
 
-        /** 预读缓冲：96k/24bit（750 KB/s）≈8 s；44.1k/16bit ≈20 s */
-        private const val PREBUFFER = 6 * 1024 * 1024
+        /** 预读缓冲：96k/24bit（750 KB/s）≈16 s；44.1k/16bit ≈40 s。
+         *  真机实测（第一百一十三轮）：6 MB 撑不住 4 s 的网络卡顿 → 提到 12 MB。 */
+        private const val PREBUFFER = 12 * 1024 * 1024
 
         private const val OUT_CAP = 1024 * 1024
+
+        /** 短读重试次数（每次递增退避 20/40/60 ms） */
+        private const val READ_RETRY = 4
     }
 
     private val info = r.info
@@ -191,7 +195,7 @@ class FlacFloatByteSource(
                     // 成功喂入：立刻回到解码，别再空转
                     continue
                 }
-                if (!inputDone) Thread.sleep(1)
+                if (!inputDone) Thread.sleep(10)
 
                 // 输入已尽：把解码器里剩下的尾部抽干
                 if (inputDone) {
@@ -345,17 +349,31 @@ class FlacFloatByteSource(
         if (offset >= src.size) return false
         val want = minOf(chunkBuf.size.toLong(), src.size - offset).toInt()
         if (want < need) return false
-        val tr = System.nanoTime()
-        val got = src.readAt(offset, chunkBuf, 0, want)
-        statReadNs += System.nanoTime() - tr
-        if (got < need) {
-            Log.w(tag, "读块不足：pos=$offset 需要 $need 实得 $got（size=${src.size}）")
-            return false
+        // 网络抖动时数据源可能只给一部分（短读）。以前这里直接返回 false，外层 1ms 后重试 →
+        // 真机上退化成"5 秒 557 次碎读"，既有额外开销又把解码卡住。现在：
+        // 有退避地重试几次，尽量凑够一帧；仍然不够才放弃（外层也会 sleep 再试）。
+        var attempt = 0
+        while (true) {
+            val tr = System.nanoTime()
+            val got = src.readAt(offset, chunkBuf, 0, want)
+            statReadNs += System.nanoTime() - tr
+            if (got >= need) {
+                blkStart = offset
+                blkLen = got
+                statChunks++
+                return true
+            }
+            if (got > 0) {          // 部分数据也要留着：先把能用的部分记下来
+                blkStart = offset
+                blkLen = got
+                statChunks++
+            }
+            if (++attempt >= READ_RETRY) {
+                Log.w(tag, "读块不足：pos=$offset 需要 $need 实得 $got（试 $attempt 次，size=${src.size}）")
+                return false
+            }
+            try { Thread.sleep(20L * attempt) } catch (ie: InterruptedException) { return false }
         }
-        blkStart = offset
-        blkLen = got
-        statChunks++
-        return true
     }
 
     private fun queue(c: MediaCodec, data: ByteArray, from: Int, size: Int, ptsUs: Long): Boolean {

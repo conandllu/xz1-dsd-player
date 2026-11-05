@@ -23,6 +23,7 @@ void set_mute(bool mute);
 // 环形缓冲写入（Kotlin producer 线程调用，非阻塞，可能部分写入）
 int ring_write(const uint8_t* data, int len);
 int ring_free();
+void reset_stats();
 int ring_used();
 void ring_reset();
 /** 丢掉未播放数据（seek 专用；读指针追平写指针） */

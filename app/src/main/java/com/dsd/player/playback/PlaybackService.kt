@@ -817,6 +817,8 @@ class PlaybackService : LifecycleService() {
             }
         }
         usb.ensureUnmuted()
+        // 预填期（淡入前）的欠载是"无声段的空洞"，不计入健康度
+        runCatching { com.dsd.player.usb.NativeBridge.nativeResetStats() }
     }
 
     private fun setRates(info: com.dsd.player.decoder.AudioInfo, cfg: com.dsd.player.usb.StreamConfig) {

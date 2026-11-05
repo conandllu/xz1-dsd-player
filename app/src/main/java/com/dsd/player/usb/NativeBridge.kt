@@ -58,6 +58,9 @@ object NativeBridge {
     /** [submitted, bytes, underruns, errors] */
     external fun nativeStats(): LongArray
 
+    /** 清空欠载/错误计数（起播预填完成后调用：预填期的欠载发生在淡入前，不该留在日志里误导） */
+    external fun nativeResetStats()
+
     // DSD 容器
     external fun nativeDsdOpen(path: String): Boolean
     external fun nativeDsdOpenFd(fd: Int, offset: Long): Boolean

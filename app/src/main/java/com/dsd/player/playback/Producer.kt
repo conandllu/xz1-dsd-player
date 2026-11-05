@@ -26,7 +26,11 @@ class Producer(
     private val onEnded: () -> Unit,
     private val onUnderrunStorm: () -> Unit,
 ) {
-    companion object { private const val TAG = "Producer" }
+    companion object {
+        private const val TAG = "Producer"
+        /** 必须与 native 的 kRingBytes 一致（app/src/main/cpp/native/usb_stream.cpp，现 4 MB） */
+        const val RING_CAPACITY = 4 * 1024 * 1024
+    }
 
     enum class DsdDataMode { NONE, NATIVE, DOP }
 
@@ -50,6 +54,8 @@ class Producer(
     private var statsReadNs = 0L
     private var statsReads = 0
     private var srcBlockMs = 0L
+    /** 环见底（<256 KB）的窗口计数：直接对应"会不会听到空洞" */
+    private var statsRingEmpty = 0
     private var packBuf = ByteArray(128 * 1024)
 
     fun start(source: AudioSource, config: StreamConfig, byteSource: ByteSource, fromPos: Long) {
@@ -111,8 +117,7 @@ class Producer(
      * 期间仍受 running 控制：用户按停止会立刻退出。
      */
     private fun drainRing() {
-        // 必须与 native 的 kRingBytes 一致（usb_stream.cpp，现 4MB）
-        val ringBytes = 4L * 1024 * 1024
+        val ringBytes = RING_CAPACITY.toLong()
         val bytesPerSec = cfg?.let { it.usbRate.toLong() * it.frameBytes } ?: 0L
         val budgetMs = if (bytesPerSec > 0)
             (ringBytes * 1000 / bytesPerSec * 1.5).toLong() + 1000 else 6000L
@@ -158,21 +163,24 @@ class Producer(
             return
         }
         if (ring < statsRingLow) statsRingLow = ring
+        if (ring < 256 * 1024) statsRingEmpty++
         val ms = now - statsAt
         if (ms < 5_000) return
         val st = usb.stats()
         val dBytes = pos - statsPos
         val need = cfg?.let { it.usbRate.toLong() * it.frameBytes } ?: 0L
         val rate = dBytes * 1000 / ms
-        val ratio = if (need > 0) dBytes.toDouble() / ms / need.toDouble() else 0.0
+        // 注意量纲：dBytes 是字节、ms 是毫秒、need 是"字节/秒" → 必须 ×1000/ms 才是 B/s
+        val ratio = if (need > 0) dBytes.toDouble() * 1000 / ms / need.toDouble() else 0.0
         Log.i(TAG, "供数：${ms / 1000}s 送出 ${dBytes / 1024}KB = ${rate / 1024}KB/s" +
             "（需求 ${need / 1024}KB/s，${String.format("%.2f", ratio)}×实时）；" +
             "underrun=${st[2]}（+${st[2] - statsUnderrun}）" +
             "ring 最低 ${statsRingLow / 1024}KB / 当前 ${ring / 1024}KB" +
             "读源阻塞 ${srcBlockMs}ms / ${statsReads} 次" +
-            (if (ratio < 0.98) " ⚠ 供数不足" else "") +
-            (if (st[2] - statsUnderrun > 0) " ⚠ 有欠载（逐步看 ring 最低是否见底）" else ""))
+            (if (statsRingLow < RING_CAPACITY / 4) " ⚠ 环低水位（<25%）" else " 正常") +
+            (if (st[2] - statsUnderrun > 0) " ⚠ 有欠载（见底 ${statsRingEmpty} 次）" else ""))
         statsAt = now; statsPos = pos; statsUnderrun = st[2].toLong(); statsRingLow = ring
+        statsRingEmpty = 0
         statsReadNs = 0; statsReads = 0
     }
 

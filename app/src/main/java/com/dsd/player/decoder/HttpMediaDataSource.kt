@@ -28,8 +28,17 @@ class HttpMediaDataSource(
         // 真机 96k/24bit 实测（第一百零二轮）：按块读的 RTT 开销会直接吃掉供数，
         // 块从 512KB → 1MB、一次补 2 块（2MB），请求数减半
         private const val BLOCK = 1024 * 1024
-        private const val MAX_BLOCKS = 24        // ≈24 MB
+        private const val MAX_BLOCKS = 32        // ≈32 MB（含预读窗口）
         private const val PREFETCH = 2           // 一次补 2 块（2 MB）；太大容易被 429
+        /**
+         * 后台预读窗口：提前把"当前位置之后 12 MB"灌进缓存。
+         *
+         * 真机（第一百一十三轮）实测：网络一抖，解码线程的同步读源会退化成"碎读 + 重试"
+         * （5 秒里 557 次、每次 ~9 KB），4 MB 环被抽干 → 泵欠载 → 滋啦。
+         * 有了预读线程，解码线程几乎总是命中缓存，网络抖动被这个窗口吸收。
+         */
+        private const val READ_AHEAD = 12 * 1024 * 1024
+        private const val PREFETCH_POLL_MS = 15L
         private const val RETRY = 3
 
         private const val UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
@@ -59,11 +68,50 @@ class HttpMediaDataSource(
             size > MAX_BLOCKS
     }
 
+    /** 最近一次被读取的位置（预读线程据此决定往后灌多远） */
+    @Volatile private var lastDemandPos: Long = 0
+    @Volatile private var prefetchStop = false
+    private var prefetchThread: Thread? = null
+
     init {
         // 用一次 Range:0-0 拿到总长度（Content-Range: bytes 0-0/123456）
         totalSize = probeSize()
         if (totalSize <= 0) throw IOException("无法确定音频总长度：$url")
         Log.i(TAG, "流大小 ${totalSize / 1024}KB：${url.take(80)}…")
+        startPrefetch()
+    }
+
+    /** 后台预读：把 [lastDemandPos, lastDemandPos + READ_AHEAD) 内的块提前灌进缓存 */
+    private fun startPrefetch() {
+        val t = Thread({
+            var p = 0L
+            var failures = 0
+            while (!prefetchStop) {
+                val demand = lastDemandPos
+                // 需求位置往后退（seek）时，预读位置也跟着回到需求处
+                if (p < demand || p > demand + READ_AHEAD) p = demand
+                if (p >= totalSize) { Thread.sleep(PREFETCH_POLL_MS); continue }
+                if (p - demand >= READ_AHEAD) { Thread.sleep(PREFETCH_POLL_MS); continue }
+                val blk = blockOf(p)
+                val hit = cache[blk] != null
+                if (hit) {
+                    p += BLOCK
+                    continue
+                }
+                try {
+                    loadBlock(blk)
+                    failures = 0
+                    p += BLOCK
+                } catch (e: Throwable) {
+                    failures++
+                    if (failures == 1) Log.w(TAG, "预读失败（第 1 次）：${e.javaClass.simpleName}: ${e.message}")
+                    // 退避：别在抖动期猛刷请求（真机上就是这样把 1 次卡顿放大成 557 次碎读）
+                    try { Thread.sleep(minOf(2000L, 200L * failures)) } catch (ie: InterruptedException) { }
+                }
+            }
+        }, "http-prefetch").apply { isDaemon = true; priority = Thread.MIN_PRIORITY }
+        prefetchThread = t
+        t.start()
     }
 
     private fun probeSize(): Long {
@@ -145,6 +193,7 @@ class HttpMediaDataSource(
     }
 
     override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+        lastDemandPos = position
         if (position >= totalSize) return -1
         val want = minOf(size.toLong(), totalSize - position).toInt()
         if (want <= 0) return -1
@@ -165,6 +214,9 @@ class HttpMediaDataSource(
     override fun getSize(): Long = totalSize
 
     override fun close() {
+        prefetchStop = true
+        prefetchThread?.interrupt()
+        prefetchThread = null
         cache.clear()
     }
 }

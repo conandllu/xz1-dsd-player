@@ -248,6 +248,13 @@ int ring_write(const uint8_t* data, int len) {
     head.store(h + n, std::memory_order_release);
     return n;
 }
+void reset_stats() {
+    // 只清"欠载/错误"这类健康度计数：起播预填阶段的欠载发生在淡入之前（听不到），
+    // 留在日志里会让人误判（真机复测时就看到一个恒定的 694 挂在那儿）。
+    g_underruns.store(0, std::memory_order_relaxed);
+    g_errors.store(0, std::memory_order_relaxed);
+}
+
 int ring_free() {
     return (int)(kRingBytes - (head.load() - tail.load()));
 }
