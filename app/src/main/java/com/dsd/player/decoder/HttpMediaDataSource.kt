@@ -72,6 +72,8 @@ class HttpMediaDataSource(
     @Volatile private var lastDemandPos: Long = 0
     @Volatile private var prefetchStop = false
     private var prefetchThread: Thread? = null
+    /** 正在下载的块（块号 → 门闩）：避免"预读线程和解码线程同时请求同一块"把带宽翻倍 */
+    private val inflight = java.util.concurrent.ConcurrentHashMap<Long, java.util.concurrent.CountDownLatch>()
 
     init {
         // 用一次 Range:0-0 拿到总长度（Content-Range: bytes 0-0/123456）
@@ -152,6 +154,28 @@ class HttpMediaDataSource(
     private fun blockOf(pos: Long): Long = pos / BLOCK
 
     private fun loadBlock(startBlock: Long): ByteArray {
+        cache[startBlock]?.let { return it }
+        // 同一个块只允许一个请求在飞：慢速网络下重复请求会白占带宽，还让解码线程多等一轮
+        val mine = java.util.concurrent.atomic.AtomicBoolean(false)
+        val latch = inflight.computeIfAbsent(startBlock) {
+            mine.set(true)
+            java.util.concurrent.CountDownLatch(1)
+        }
+        if (!mine.get()) {
+            try { latch.await(30, java.util.concurrent.TimeUnit.SECONDS) } catch (ie: InterruptedException) { }
+            cache[startBlock]?.let { return it }
+        }
+        try {
+            return fetchBlock(startBlock)
+        } finally {
+            if (mine.get()) {
+                inflight.remove(startBlock)
+                latch.countDown()
+            }
+        }
+    }
+
+    private fun fetchBlock(startBlock: Long): ByteArray {
         cache[startBlock]?.let { return it }
         val from = startBlock * BLOCK
         val to = minOf(from + BLOCK * PREFETCH - 1, totalSize - 1)
