@@ -136,7 +136,7 @@ class PlaybackService : LifecycleService() {
                 runCatching { bs.seek(pos) }
                 producer.start(s, cfg, bs, pos)
                 producer.paused = false
-                usb.ensureUnmuted()
+                prefillRingThenUnmute()
                 playPosBytes = pos
                 PlayerBus.errorMessage = ""
                 PlayerBus.connected = usb.connected
@@ -598,7 +598,7 @@ class PlaybackService : LifecycleService() {
             producer.start(src, cfg, bs, 0)
             // 切歌/起播后强制状态一致：未暂停 + 未静音（否则按"播放"会走淡出）
             producer.paused = false
-            usb.ensureUnmuted()
+            prefillRingThenUnmute()
             PlayerBus.errorMessage = ""
             PlayerBus.playing = true
             PlayerBus.status = "playing"
@@ -789,6 +789,35 @@ class PlaybackService : LifecycleService() {
 
     private fun openStreamFor(s: AudioSource) =
         if (s.info.isDsd) s.openDsd() else s.openPcm()
+
+    /**
+     * 起播/恢复前先把环形缓冲灌到"约 1.2 秒"的水位，再解除静音。
+     *
+     * 为什么：native 泵在静音态不消耗环形缓冲，所以"灌饱再放开"能一次把水位抬到目标高度；
+     * 否则水位会停在 0 附近徘徊（生产≈消耗），任何几十毫秒的抖动都会变成一次欠载——
+     * 真机 96k/24bit 上就是"偶发滋啦"（约 8~10 次/s，且 ring 水位看着还行）。
+     * 上限 1.5 s 或 70% 容量，超时就照常起播，不会卡住。
+     */
+    private fun prefillRingThenUnmute() {
+        val cap = 4 * 1024 * 1024                      // 与 native kRingBytes 一致
+        val byTime = usbBytesPerSec * 800 / 1000       // 约 0.8 s 的数据量（起播最多多等 ~0.2 s）
+        val target = minOf((cap * 0.7).toLong(), byTime).toInt()
+        if (target > 0) {
+            val deadline = System.currentTimeMillis() + 1200
+            var last = 0
+            while (System.currentTimeMillis() < deadline) {
+                if (!usb.connected) break
+                last = usb.ringUsed()
+                if (last >= target) break
+                try { Thread.sleep(10) } catch (ie: InterruptedException) { break }
+            }
+            if (com.dsd.player.BuildConfig.DEBUG) {
+                Log.i(TAG, "起播预填：ring=${last / 1024}KB / 目标 ${target / 1024}KB" +
+                    "（${if (last >= target) "已达标" else "超时"}）")
+            }
+        }
+        usb.ensureUnmuted()
+    }
 
     private fun setRates(info: com.dsd.player.decoder.AudioInfo, cfg: com.dsd.player.usb.StreamConfig) {
         srcBytesPerSec = if (info.isDsd) (info.dsdRateHz / 4).toLong()

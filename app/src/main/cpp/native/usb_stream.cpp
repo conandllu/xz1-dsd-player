@@ -23,10 +23,10 @@ namespace {
 
 constexpr int kXfers = 6;            // 在途传输数
 constexpr int kPktsPerXfer = 8;      // 每个传输的微帧包数（8 × 125µs = 1ms）
-// 2MB 环形缓冲：真机 96k/24bit 实测（第一百零四轮）1MB 只够 1.3s，稳态 1.000× 下仍有
-// ~12 次/s 的欠载（周期性抖动直接被写进 DAC）；提到 2MB（96k/24bit ≈2.6s、44.1k/16bit ≈5.9s）
-// 用来吸收网络/解码抖动。注意 Producer.kt 的 drainRing 预算也按这个值算。
-constexpr int kRingBytes = 2 << 20;
+// 4MB 环形缓冲：96k/24bit（768KB/s）≈5.2s、44.1k/16bit ≈11.9s。
+// 演进：1MB 时 96k 有 ~270 次/s 欠载 → 2MB 降到 ~10 次/s（供数周期性突发，余量仍薄）
+//       → 4MB 让"每轮突发之间"的抖动有更大冗余。注意 Producer.kt 的 drainRing 预算同步。
+constexpr int kRingBytes = 4 << 20;
 
 // ── 无锁 SPSC 环形缓冲 ──
 std::vector<uint8_t> ring(kRingBytes);
@@ -143,7 +143,22 @@ void pump(libusb_transfer* xfer) {
         fill_silence(xfer->buffer, total);
     } else if (got < total) {
         // 只有缺得明显（≥2 帧）才算一次欠载；单包差几个字节属瞬态，可闻性无意义
-        if (total - got >= g_frame_bytes * 2) g_underruns.fetch_add(1, std::memory_order_relaxed);
+        if (total - got >= g_frame_bytes * 2) {
+            g_underruns.fetch_add(1, std::memory_order_relaxed);
+#if LOG_NDEBUG == 0
+            // 调试：每秒最多打一条，说明"差多少字节、环里当时还剩多少"
+            static std::atomic<long> last_log_ms{0};
+            long now_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            long prev = last_log_ms.load(std::memory_order_relaxed);
+            if (now_ms - prev >= 1000 && last_log_ms.compare_exchange_strong(prev, now_ms)) {
+                long h2 = tail.load(std::memory_order_relaxed);
+                long avail2 = head.load(std::memory_order_acquire) - h2;
+                LOGW("欠载：URB 需 %d B，只取到 %d B（差 %d B），环里剩 %ld B",
+                     total, got, total - got, avail2);
+            }
+#endif
+        }
         fill_silence(xfer->buffer + got, total - got);
     }
 

@@ -47,6 +47,9 @@ class Producer(
     private var statsPos = 0L
     private var statsUnderrun = 0L
     private var statsRingLow = Int.MAX_VALUE
+    private var statsReadNs = 0L
+    private var statsReads = 0
+    private var srcBlockMs = 0L
     private var packBuf = ByteArray(128 * 1024)
 
     fun start(source: AudioSource, config: StreamConfig, byteSource: ByteSource, fromPos: Long) {
@@ -108,8 +111,8 @@ class Producer(
      * 期间仍受 running 控制：用户按停止会立刻退出。
      */
     private fun drainRing() {
-        // 必须与 native 的 kRingBytes 一致（usb_stream.cpp，现 2MB）
-        val ringBytes = 2L * 1024 * 1024
+        // 必须与 native 的 kRingBytes 一致（usb_stream.cpp，现 4MB）
+        val ringBytes = 4L * 1024 * 1024
         val bytesPerSec = cfg?.let { it.usbRate.toLong() * it.frameBytes } ?: 0L
         val budgetMs = if (bytesPerSec > 0)
             (ringBytes * 1000 / bytesPerSec * 1.5).toLong() + 1000 else 6000L
@@ -156,7 +159,7 @@ class Producer(
         }
         if (ring < statsRingLow) statsRingLow = ring
         val ms = now - statsAt
-        if (ms < 10_000) return
+        if (ms < 5_000) return
         val st = usb.stats()
         val dBytes = pos - statsPos
         val need = cfg?.let { it.usbRate.toLong() * it.frameBytes } ?: 0L
@@ -164,13 +167,19 @@ class Producer(
         val ratio = if (need > 0) dBytes.toDouble() / ms / need.toDouble() else 0.0
         Log.i(TAG, "供数：${ms / 1000}s 送出 ${dBytes / 1024}KB = ${rate / 1024}KB/s" +
             "（需求 ${need / 1024}KB/s，${String.format("%.2f", ratio)}×实时）；" +
-            "underrun=${st[2]}（+${st[2] - statsUnderrun}）ring 最低 ${statsRingLow / 1024}KB" +
-            (if (ratio < 0.98) " ⚠ 供数不足" else ""))
+            "underrun=${st[2]}（+${st[2] - statsUnderrun}）" +
+            "ring 最低 ${statsRingLow / 1024}KB / 当前 ${ring / 1024}KB" +
+            "读源阻塞 ${srcBlockMs}ms / ${statsReads} 次" +
+            (if (ratio < 0.98) " ⚠ 供数不足" else "") +
+            (if (st[2] - statsUnderrun > 0) " ⚠ 有欠载（逐步看 ring 最低是否见底）" else ""))
         statsAt = now; statsPos = pos; statsUnderrun = st[2].toLong(); statsRingLow = ring
+        statsReadNs = 0; statsReads = 0
     }
 
     private fun loop() {
-        val buf = ByteArray(64 * 1024)
+        // 一次读大一点：96k/24bit 时 64KB 只有 85ms，一秒钟要醒 12 次，每次都可能把环
+        // 拖到"差一个 URB"；256KB（≈340ms @96k/24bit）把唤醒次数降到 3 次/秒。
+        val buf = ByteArray(256 * 1024)
         try {
             while (running.get()) {
                 if (paused) { Thread.sleep(20); continue }
@@ -191,7 +200,11 @@ class Producer(
                     continue
                 }
                 val s = src ?: break
+                val tRead = System.nanoTime()
                 val n = s.read(buf, 0, buf.size)
+                statsReadNs += System.nanoTime() - tRead
+                statsReads++
+                srcBlockMs = statsReadNs / 1_000_000
                 if (n < 0) { Log.e(TAG, "read error"); break }
                 if (n == 0) { pos = s.lengthBytes; reachedEof = true; break }
                 val data: ByteArray
@@ -239,7 +252,7 @@ class Producer(
                 onProgress(playedBytes(), s.lengthBytes)
                 logSupplyRate()
             }
-            // 读完文件的瞬间环形缓冲里还压着最多 2MB（≈5.9 s @44.1k/16bit）没送出去，
+            // 读完文件的瞬间环形缓冲里还压着最多 4MB（≈11.9 s @44.1k/16bit）没送出去，
             // 直接收尾会把这段音乐整段丢掉——必须等水位归零再结束。
             if (running.get() && reachedEof) drainRing()
             if (running.get()) onEnded()
