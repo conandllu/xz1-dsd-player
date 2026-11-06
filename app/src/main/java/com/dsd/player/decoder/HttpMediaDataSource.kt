@@ -72,6 +72,9 @@ class HttpMediaDataSource(
     @Volatile private var lastDemandPos: Long = 0
     @Volatile private var prefetchStop = false
     private var prefetchThread: Thread? = null
+    /** 只取到一部分的块（冷启动小块），再次访问时要补全 */
+    private val partialBlocks: MutableSet<Long> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
     /** 正在下载的块（块号 → 门闩）：避免"预读线程和解码线程同时请求同一块"把带宽翻倍 */
     private val inflight = java.util.concurrent.ConcurrentHashMap<Long, java.util.concurrent.CountDownLatch>()
 
@@ -154,7 +157,11 @@ class HttpMediaDataSource(
     private fun blockOf(pos: Long): Long = pos / BLOCK
 
     private fun loadBlock(startBlock: Long): ByteArray {
-        cache[startBlock]?.let { return it }
+        // 注意：**不能**在"部分是缓存"时直接返回 —— 冷启动只取了 1/4 块，
+        // 直接返回会让读取在块尾突然变短（真机表现为"解码到 0.4 秒就到底了"）。
+        cache[startBlock]?.let { have ->
+            if (have.size >= BLOCK || !partialBlocks.contains(startBlock)) return have
+        }
         // 同一个块只允许一个请求在飞：慢速网络下重复请求会白占带宽，还让解码线程多等一轮
         val mine = java.util.concurrent.atomic.AtomicBoolean(false)
         val latch = inflight.computeIfAbsent(startBlock) {
@@ -163,7 +170,9 @@ class HttpMediaDataSource(
         }
         if (!mine.get()) {
             try { latch.await(30, java.util.concurrent.TimeUnit.SECONDS) } catch (ie: InterruptedException) { }
-            cache[startBlock]?.let { return it }
+            cache[startBlock]?.let { have ->
+                if (have.size >= BLOCK || !partialBlocks.contains(startBlock)) return have
+            }
         }
         try {
             return fetchBlock(startBlock)
@@ -176,9 +185,18 @@ class HttpMediaDataSource(
     }
 
     private fun fetchBlock(startBlock: Long): ByteArray {
-        cache[startBlock]?.let { return it }
+        cache[startBlock]?.let { have ->
+            // 冷启动时只取了 1/4 块；后续读到这块尾部时必须补全，否则 readAt 会读到空洞
+            return if (have.size >= BLOCK || !partialBlocks.contains(startBlock)) have
+                   else completeBlock(startBlock, have)
+        }
         val from = startBlock * BLOCK
-        val to = minOf(from + BLOCK * PREFETCH - 1, totalSize - 1)
+        // 冷启动（缓存还是空的）先只取 1/4 块：
+        // 首块要 2 MB 时，96k/24bit 在 465 KB/s 的公网 WebDAV 上光"等第一块"就要 4.3 s，
+        // 表现就是"切歌/起播 4 秒才出声"。小块够解出 STREAMINFO 与头几帧，后续靠预读线程补。
+        val coldStart = cache.isEmpty()
+        val span = if (coldStart) minOf(BLOCK / 4L, BLOCK * PREFETCH.toLong()) else BLOCK * PREFETCH.toLong()
+        val to = minOf(from + span - 1, totalSize - 1)
         val req = Request.Builder().url(url)
             .header("User-Agent", UA)
             .header("Range", "bytes=$from-$to")
@@ -191,10 +209,34 @@ class HttpMediaDataSource(
         while (off < body.size) {
             val n = minOf(BLOCK, body.size - off)
             cache[b] = body.copyOfRange(off, off + n)
+            if (n < BLOCK) partialBlocks.add(b) else partialBlocks.remove(b)
             off += n
             b++
         }
         return cache[startBlock] ?: throw IOException("Range 返回长度不足")
+    }
+
+    /** 把"冷启动只取了一部分"的块补完整（只补到块尾，不跨块） */
+    private fun completeBlock(startBlock: Long, have: ByteArray): ByteArray {
+        val blockStart = startBlock * BLOCK
+        val from = blockStart + have.size
+        val to = minOf(blockStart + BLOCK - 1, totalSize - 1)
+        if (from > to) {
+            partialBlocks.remove(startBlock)
+            return have
+        }
+        val req = Request.Builder().url(url)
+            .header("User-Agent", UA)
+            .header("Range", "bytes=$from-$to")
+            .apply { headers.forEach { (k, v) -> header(k, v) } }
+            .build()
+        val body = fetchWithRetry(req, from, to)
+        val merged = ByteArray(have.size + body.size)
+        System.arraycopy(have, 0, merged, 0, have.size)
+        System.arraycopy(body, 0, merged, have.size, body.size)
+        cache[startBlock] = merged
+        if (merged.size >= BLOCK) partialBlocks.remove(startBlock) else partialBlocks.add(startBlock)
+        return merged
     }
 
     /** 429/5xx 之类限流要退避重试，否则 MediaExtractor 的 seek（会连发多个 Range）容易失败 */
@@ -242,5 +284,6 @@ class HttpMediaDataSource(
         prefetchThread?.interrupt()
         prefetchThread = null
         cache.clear()
+        partialBlocks.clear()
     }
 }

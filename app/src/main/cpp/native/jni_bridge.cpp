@@ -165,9 +165,10 @@ Java_com_dsd_player_usb_NativeBridge_nativeRingWrite(JNIEnv* env, jobject, jbyte
 JNIEXPORT jlongArray JNICALL
 Java_com_dsd_player_usb_NativeBridge_nativeStats(JNIEnv* env, jobject) {
     auto s = usbaudio::stats();
-    jlong v[4] = {s.submitted, s.bytes, s.underruns, s.errors};
-    jlongArray a = env->NewLongArray(4);
-    env->SetLongArrayRegion(a, 0, 4, v);
+    // [0]=submitted [1]=bytes [2]=稳态欠载 [3]=错误 [4]=起播欠载
+    jlong v[5] = {s.submitted, s.bytes, s.underruns, s.errors, s.startup_underruns};
+    jlongArray a = env->NewLongArray(5);
+    env->SetLongArrayRegion(a, 0, 5, v);
     return a;
 }
 

@@ -58,6 +58,10 @@ bool g_dop = false;                // DoP 模式（载荷是 DSD，不能乘增�
 bool g_dop_phase = false;          // DoP 静音帧的 marker 交替相位
 std::atomic<long> g_submitted{0};
 std::atomic<int> g_underruns{0};
+// 起播阶段（还没拿到第一条真实数据）的欠载单独计数：稳态 0 但有起播欠载时，
+// 用户听到的是"播放/切歌开头咔一声"，日志里别把它和稳态混在一起。
+std::atomic<int> g_startup_underruns{0};
+std::atomic<bool> g_first_data{false};
 std::atomic<int> g_errors{0};
 
 std::vector<libusb_transfer*> g_xfers;
@@ -138,13 +142,20 @@ void pump(libusb_transfer* xfer) {
             got = n;
         }
     }
+    if (got > 0 && !g_first_data.load(std::memory_order_relaxed)) {
+        g_first_data.store(true, std::memory_order_relaxed);
+    }
     if (silent) {
         // 全静音态：整段填静音（DoP 保留 marker），不消耗环形缓冲
         fill_silence(xfer->buffer, total);
     } else if (got < total) {
         // 只有缺得明显（≥2 帧）才算一次欠载；单包差几个字节属瞬态，可闻性无意义
         if (total - got >= g_frame_bytes * 2) {
-            g_underruns.fetch_add(1, std::memory_order_relaxed);
+            if (!g_first_data.load(std::memory_order_relaxed)) {
+                g_startup_underruns.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_underruns.fetch_add(1, std::memory_order_relaxed);
+            }
 #if LOG_NDEBUG == 0
             // 调试：每秒最多打一条，说明"差多少字节、环里当时还剩多少"
             static std::atomic<long> last_log_ms{0};
@@ -300,13 +311,19 @@ bool start(int fd, const StreamInfo& info, int rate_hz, int frame_bytes,
     g_frame_bytes = frame_bytes;
     g_dsd = dsd_mode;
     g_dop = dop_mode;
-    g_gain.store(1.0f);
-    g_target.store(1.0f);
+    // 泵**一启动就是静音态**：此时环形缓冲还是空的，静音分支不读缓冲、也不计欠载，
+    // 上层可以在"有流但静音"的窗口里把缓冲预填到目标水位，再 set_mute(false) 淡入。
+    // 以前这里是 gain=1/target=1，泵一起来就抢数据 → 第一包必然欠载（起播"咔"一声）。
+    g_gain.store(0.0f);
+    g_target.store(0.0f);
+    g_silent.store(true);
 
     // 统计清零（否则上一次会话的欠载计数会让 Producer 误判断流）
     g_bytes.store(0);
     g_submitted.store(0);
     g_underruns.store(0);
+    g_startup_underruns.store(0);
+    g_first_data.store(false);
     g_errors.store(0);
     g_inflight.store(0);
 
@@ -498,7 +515,7 @@ void set_mute(bool mute) {
 
 Stats stats() {
     return Stats{g_submitted.load(), g_bytes.load(), g_underruns.load(),
-                 g_errors.load()};
+                 g_errors.load(), g_startup_underruns.load()};
 }
 
 } // namespace usbaudio

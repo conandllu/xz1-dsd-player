@@ -59,6 +59,12 @@ class FlacFloatByteSource(
 
         /** 短读重试次数（每次递增退避 20/40/60 ms） */
         private const val READ_RETRY = 4
+
+        /** 单次读源的最小字节数。
+         *  以前一次就要 2.6 MB（帧缓冲整块），96k/24bit 在 465 KB/s 的公网 WebDAV 上
+         *  光等这一块就要 4.3 s —— 这就是"切歌/起播首帧要 4 秒"的来源。
+         *  现在按 max(128 KB, 帧长×2) 取：首帧 ~0.3 s 就能到，后续靠预读线程补大块。 */
+        private const val READ_MIN = 128 * 1024
     }
 
     private val info = r.info
@@ -347,7 +353,8 @@ class FlacFloatByteSource(
     private fun ensureBlock(offset: Long, need: Int): Boolean {
         if (offset >= blkStart && offset + need <= blkStart + blkLen) return true
         if (offset >= src.size) return false
-        val want = minOf(chunkBuf.size.toLong(), src.size - offset).toInt()
+        val want = minOf(maxOf(READ_MIN.toLong(), need.toLong() * 2),
+                         chunkBuf.size.toLong(), src.size - offset).toInt()
         if (want < need) return false
         // 网络抖动时数据源可能只给一部分（短读）。以前这里直接返回 false，外层 1ms 后重试 →
         // 真机上退化成"5 秒 557 次碎读"，既有额外开销又把解码卡住。现在：

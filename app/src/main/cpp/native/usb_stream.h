@@ -39,8 +39,9 @@ bool seek_flush_blocking(int timeout_ms);
 struct Stats {
     long submitted;
     long bytes;
-    int underruns;
+    int underruns;          // 稳态欠载
     int errors;
+    int startup_underruns;  // 起播阶段（还没拿到第一条真实数据）的欠载
 };
 Stats stats();
 

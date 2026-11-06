@@ -235,6 +235,9 @@ class PlaybackService : LifecycleService() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        // 先把前台通知挂上：冷启动时 startForegroundService 有 ~5s 窗口，
+        // 之前它排在 monitor.register() / MediaSession 之后，冷启动慢的机型容易踩线。
+        runCatching { startForeground(NOTIF_ID, buildNotification(getString(R.string.app_name))) }
         NativeBridge.ensureLoaded()
         com.dsd.player.data.QobuzResolver.init(this)
         com.dsd.player.data.WebDavResolver.init(this)
@@ -281,6 +284,7 @@ class PlaybackService : LifecycleService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
+        mainHandler.removeCallbacks(idleStop)
         when (intent?.action) {
             PlayerBus.ACTION_PLAY -> {
                 val uri = if (Build.VERSION.SDK_INT >= 33)
@@ -800,10 +804,15 @@ class PlaybackService : LifecycleService() {
      */
     private fun prefillRingThenUnmute() {
         val cap = 4 * 1024 * 1024                      // 与 native kRingBytes 一致
-        val byTime = usbBytesPerSec * 800 / 1000       // 约 0.8 s 的数据量（起播最多多等 ~0.2 s）
+        // 真机实测（第一百一十七轮）：96k/24bit 目标 0.8 s（600 KB）在首块网络读取 4 s 的场景下
+        // 必然超时 → 起播欠载。现在：目标按 0.5 s 音频量算，超时放宽到 6 s；
+        // 而且泵改成"启动即静音"，预填期间不会被抽干，这个目标基本都能达到。
+        val byTime = usbBytesPerSec * 500 / 1000       // 约 0.5 s 的数据量
         val target = minOf((cap * 0.7).toLong(), byTime).toInt()
         if (target > 0) {
-            val deadline = System.currentTimeMillis() + 1200
+            // 2.5 s 上限：泵是静音启动的，正常情况下 0.5~1 s 就能达标；网络极慢时也不能让
+            // 用户干等 6 s —— 超时就带着已灌到的水位淡入（宁可开头少一点余量）。
+            val deadline = System.currentTimeMillis() + 2500
             var last = 0
             while (System.currentTimeMillis() < deadline) {
                 if (!usb.connected) break
@@ -899,6 +908,14 @@ class PlaybackService : LifecycleService() {
         return n
     }
 
+    /** 停止后保留服务的宽限期：60s 内再播直接用现成进程，不用冷启动（真机"停止→再播没反应"） */
+    private val idleStop = Runnable {
+        Log.i(TAG, "空闲 60s：释放并停止服务")
+        runCatching { producer.stop() }
+        runCatching { usb.stopStream() }
+        stopSelf()
+    }
+
     private fun stopInternal() {
         // 开流还在工作线程里跑：把"停"排到它后面，避免 native 层一边开流一边 release
         if (isMainThread() && opening.get()) { postOpen("stopInternal") { stopInternal() }; return }
@@ -920,6 +937,9 @@ class PlaybackService : LifecycleService() {
         PlayerBus.queueIndex = queueIndex
         PlayerBus.queueSize = queue.size
         notifyUi()
+        // 不立刻 stopSelf：留 60s 宽限，期间"停止→再播"、切歌都是热路径
+        mainHandler.removeCallbacks(idleStop)
+        mainHandler.postDelayed(idleStop, 60_000)
     }
 
     private fun updateSession() = notifyUi()
@@ -965,13 +985,28 @@ class PlaybackService : LifecycleService() {
             Intent(PlayerBus.ACTION_PAUSE).setComponent(
                 android.content.ComponentName(this, PlaybackService::class.java)),
             PendingIntent.FLAG_IMMUTABLE)
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_fg)
             .setContentTitle(title.ifBlank { getString(R.string.app_name) })
             .setContentText(PlayerBus.outputMode.ifBlank { PlayerBus.usbLabel })
             .setContentIntent(pi)
             .setOngoing(true)
             .addAction(0, if (PlayerBus.playing) getString(R.string.pause) else getString(R.string.play), pausePi)
-            .build()
+        // mediaPlayback 类型的前台服务必须让通知与 MediaSession 关联，否则系统会认为
+        // "FGS 没有绑定会话"（日志里的 setFgsIfNoSessionIsLinkedToNotification），
+        // 进而在暂停/停止后把进程回收（真机表现为"停止→再播没反应"、intent 被丢一半）。
+        val token = runCatching { mediaSession?.sessionToken }.getOrNull()
+        if (token != null) {
+            @Suppress("DEPRECATION")
+            val compat = runCatching {
+                android.support.v4.media.session.MediaSessionCompat.Token.fromToken(token)
+            }.getOrNull()
+            if (compat != null) {
+                builder.setStyle(androidx.media.app.NotificationCompat.MediaStyle()
+                    .setMediaSession(compat)
+                    .setShowActionsInCompactView(0))
+            }
+        }
+        return builder.build()
     }
 }

@@ -175,6 +175,7 @@ class Producer(
         Log.i(TAG, "供数：${ms / 1000}s 送出 ${dBytes / 1024}KB = ${rate / 1024}KB/s" +
             "（需求 ${need / 1024}KB/s，${String.format("%.2f", ratio)}×实时）；" +
             "underrun=${st[2]}（+${st[2] - statsUnderrun}）" +
+            (if (st.size > 4) " 起播欠载=${st[4]}" else "") +
             "ring 最低 ${statsRingLow / 1024}KB / 当前 ${ring / 1024}KB" +
             "读源阻塞 ${srcBlockMs}ms / ${statsReads} 次" +
             (if (statsRingLow < RING_CAPACITY / 4) " ⚠ 环低水位（<25%）" else " 正常") +
