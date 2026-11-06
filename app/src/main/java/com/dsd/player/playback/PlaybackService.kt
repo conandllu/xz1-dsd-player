@@ -424,6 +424,7 @@ class PlaybackService : LifecycleService() {
                             val bs = openStreamFor(s)
                             setRates(s.info, cfg)
                             producer.start(s, cfg, bs, playPosBytes)
+                            prefillRingThenUnmute()
                         }.onFailure { PlayerBus.errorMessage = "DAC 重连失败：${it.message}" }
                         opening.set(false)
                     }
@@ -437,6 +438,7 @@ class PlaybackService : LifecycleService() {
                     val bs = openStreamFor(s)
                     setRates(s.info, cfg)
                     producer.start(s, cfg, bs, playPosBytes)
+                    prefillRingThenUnmute()
                 }.onFailure { PlayerBus.errorMessage = "DAC 重连失败：${it.message}" }
                 opening.set(false)
             }
@@ -849,6 +851,8 @@ class PlaybackService : LifecycleService() {
             setRates(s.info, cfg)
             bs.seek(pos)
             producer.start(s, cfg, bs, pos)
+            // 泵是静音启动的：切模式重开流之后必须重新预填 + 淡入，否则"切了模式就听不到声"
+            prefillRingThenUnmute()
             PlayerBus.errorMessage = ""
             PlayerBus.playing = true
         }.onFailure { PlayerBus.errorMessage = "切换模式失败：${it.message}" }
