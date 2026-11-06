@@ -799,6 +799,7 @@ class PlaybackService : LifecycleService() {
     /**
      * 起播/恢复前先把环形缓冲灌到"约 1.2 秒"的水位，再解除静音。
      *
+     * 目标取 max(0.75 s 音频量, …)（上限 70% 容量），等待上限 2.5 s。
      * 为什么：native 泵在静音态不消耗环形缓冲，所以"灌饱再放开"能一次把水位抬到目标高度；
      * 否则水位会停在 0 附近徘徊（生产≈消耗），任何几十毫秒的抖动都会变成一次欠载——
      * 真机 96k/24bit 上就是"偶发滋啦"（约 8~10 次/s，且 ring 水位看着还行）。
@@ -809,7 +810,9 @@ class PlaybackService : LifecycleService() {
         // 真机实测（第一百一十七轮）：96k/24bit 目标 0.8 s（600 KB）在首块网络读取 4 s 的场景下
         // 必然超时 → 起播欠载。现在：目标按 0.5 s 音频量算，超时放宽到 6 s；
         // 而且泵改成"启动即静音"，预填期间不会被抽干，这个目标基本都能达到。
-        val byTime = usbBytesPerSec * 500 / 1000       // 约 0.5 s 的数据量
+        // 0.75 s：真机复测（第一百一十九轮）发现 0.5 s 预填在淡入后第一个 5 s 窗口
+        // 就被吃到 ring 只剩 9 KB（靠静音启动才没顶穿），所以加 250 ms 余量。
+        val byTime = usbBytesPerSec * 750 / 1000
         val target = minOf((cap * 0.7).toLong(), byTime).toInt()
         if (target > 0) {
             // 2.5 s 上限：泵是静音启动的，正常情况下 0.5~1 s 就能达标；网络极慢时也不能让
@@ -841,7 +844,9 @@ class PlaybackService : LifecycleService() {
 
     private fun restartWithMode(modeName: String?) {
         if (isMainThread()) { postOpen("restartWithMode") { restartWithMode(modeName) }; return }
-        val pos = playPosBytes
+        // 用"此刻真实已播字节"而不是上次上报的 playPosBytes：后者最多滞后一个读块，
+        // 真机上切模式回退 0.2~1.8 s 就是这么来的。
+        val pos = runCatching { producer.played() }.getOrDefault(playPosBytes)
         val s = source ?: return
         runCatching {
             producer.stop()

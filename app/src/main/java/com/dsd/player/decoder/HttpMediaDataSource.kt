@@ -79,44 +79,104 @@ class HttpMediaDataSource(
     private val inflight = java.util.concurrent.ConcurrentHashMap<Long, java.util.concurrent.CountDownLatch>()
 
     init {
-        // 用一次 Range:0-0 拿到总长度（Content-Range: bytes 0-0/123456）
-        totalSize = probeSize()
+        // 一次 Range 同时拿"总长度 + 首块数据"：以前是 Range:0-0 只探长度、再单独取首块，
+        // 起播白白多花一个 RTT（公网 150~300 ms，占"首帧 3.2 s"里可观的一段）。
+        primeFirstChunk()
         if (totalSize <= 0) throw IOException("无法确定音频总长度：$url")
         Log.i(TAG, "流大小 ${totalSize / 1024}KB：${url.take(80)}…")
         startPrefetch()
     }
 
-    /** 后台预读：把 [lastDemandPos, lastDemandPos + READ_AHEAD) 内的块提前灌进缓存 */
+    /** 一次请求拿到总长度并把首块（1/4 块）直接灌进缓存 */
+    private fun primeFirstChunk() {
+        val want = (BLOCK / 4).toInt()
+        val req = Request.Builder().url(url)
+            .header("User-Agent", UA)
+            .header("Range", "bytes=0-${want - 1}")
+            .apply { headers.forEach { (k, v) -> header(k, v) } }
+            .build()
+        ok.newCall(req).execute().use { r ->
+            val cr = r.header("Content-Range")
+            val cl = r.header("Content-Length")
+            Log.i(TAG, "探测：code=${r.code} Content-Range=$cr Content-Length=$cl " +
+                "Accept-Ranges=${r.header("Accept-Ranges")}")
+            totalSize = cr?.substringAfterLast('/')?.toLongOrNull()?.takeIf { it > 0 }
+                ?: cl?.toLongOrNull()?.takeIf { r.code == 200 && it > 0 }
+                ?: -1
+            if (!r.isSuccessful) throw IOException("HTTP ${r.code}（探测）")
+            // 有界读取：服务器若忽略 Range 回 200 + 整文件，也绝不能整个读进内存
+            val body = r.body ?: return
+            val buf = ByteArray(want)
+            var off = 0
+            body.byteStream().use { ins ->
+                while (off < want) {
+                    val n = ins.read(buf, off, want - off)
+                    if (n <= 0) break
+                    off += n
+                }
+            }
+            if (off > 0) {
+                cache[0L] = if (off == want) buf else buf.copyOf(off)
+                if (off < BLOCK) partialBlocks.add(0L) else partialBlocks.remove(0L)
+            }
+        }
+    }
+
+    /**
+     * 后台预读：把 [lastDemandPos, lastDemandPos + READ_AHEAD) 内的块提前灌进缓存。
+     *
+     * ⚠ 停止**只靠 `prefetchStop` 标志**，绝不 interrupt：真机复测（第一百一十九轮）上，
+     * `close()` 里的 `interrupt()` 正好打在 `Thread.sleep` 上 → 抛 `InterruptedException` →
+     * 线程没捕获 → `FATAL EXCEPTION: http-prefetch` → 进程被杀 → 下一次 PLAY 被吞
+     * （表现为"点播放没反应"，起播 8 次里挂 3 次）。这里所有 sleep 都吃掉中断并退出循环，
+     * 整个循环再包一层兜底 try/catch，保证这个线程任何情况下都不会把进程带崩。
+     */
     private fun startPrefetch() {
         val t = Thread({
-            var p = 0L
-            var failures = 0
-            while (!prefetchStop) {
-                val demand = lastDemandPos
-                // 需求位置往后退（seek）时，预读位置也跟着回到需求处
-                if (p < demand || p > demand + READ_AHEAD) p = demand
-                if (p >= totalSize) { Thread.sleep(PREFETCH_POLL_MS); continue }
-                if (p - demand >= READ_AHEAD) { Thread.sleep(PREFETCH_POLL_MS); continue }
-                val blk = blockOf(p)
-                val hit = cache[blk] != null
-                if (hit) {
-                    p += BLOCK
-                    continue
+            try {
+                var p = 0L
+                var failures = 0
+                while (!prefetchStop) {
+                    val demand = lastDemandPos
+                    // 需求位置往后退（seek）时，预读位置也跟着回到需求处
+                    if (p < demand || p > demand + READ_AHEAD) p = demand
+                    if (p >= totalSize || p - demand >= READ_AHEAD) {
+                        if (!sleepQuietly(PREFETCH_POLL_MS)) return@Thread
+                        continue
+                    }
+                    val blk = blockOf(p)
+                    if (cache[blk] != null) {
+                        p += BLOCK
+                        continue
+                    }
+                    try {
+                        loadBlock(blk)
+                        failures = 0
+                        p += BLOCK
+                    } catch (e: Throwable) {
+                        failures++
+                        if (failures == 1) {
+                            Log.w(TAG, "预读失败（第 1 次）：${e.javaClass.simpleName}: ${e.message}")
+                        }
+                        // 退避：别在抖动期猛刷请求（真机上就是这样把 1 次卡顿放大成 557 次碎读）
+                        if (!sleepQuietly(minOf(2000L, 200L * failures))) return@Thread
+                    }
                 }
-                try {
-                    loadBlock(blk)
-                    failures = 0
-                    p += BLOCK
-                } catch (e: Throwable) {
-                    failures++
-                    if (failures == 1) Log.w(TAG, "预读失败（第 1 次）：${e.javaClass.simpleName}: ${e.message}")
-                    // 退避：别在抖动期猛刷请求（真机上就是这样把 1 次卡顿放大成 557 次碎读）
-                    try { Thread.sleep(minOf(2000L, 200L * failures)) } catch (ie: InterruptedException) { }
-                }
+            } catch (t2: Throwable) {
+                Log.w(TAG, "预读线程退出：${t2.javaClass.simpleName}: ${t2.message}")
             }
         }, "http-prefetch").apply { isDaemon = true; priority = Thread.MIN_PRIORITY }
         prefetchThread = t
         t.start()
+    }
+
+    /** sleep，但把中断当成"该退出了"：返回 false 表示要结束循环（绝不把中断抛给上层） */
+    private fun sleepQuietly(ms: Long): Boolean = try {
+        Thread.sleep(ms)
+        !prefetchStop
+    } catch (ie: InterruptedException) {
+        Thread.currentThread().interrupt()   // 保留中断语义，但我们自己退出
+        false
     }
 
     private fun probeSize(): Long {
@@ -280,8 +340,8 @@ class HttpMediaDataSource(
     override fun getSize(): Long = totalSize
 
     override fun close() {
+        // 只置标志，不 interrupt：见 startPrefetch() 的说明
         prefetchStop = true
-        prefetchThread?.interrupt()
         prefetchThread = null
         cache.clear()
         partialBlocks.clear()

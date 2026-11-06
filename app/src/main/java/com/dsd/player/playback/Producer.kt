@@ -100,6 +100,9 @@ class Producer(
 
     fun positionBytes(): Long = pos
 
+    /** 此刻"真正已送出"的字节数（读块可能领先，但 ring 里未播的部分会被扣掉）——切模式/恢复用 */
+    fun played(): Long = playedBytes()
+
     /** 已播放字节 = 已读出字节 − 环形缓冲里尚未送出的字节（含 DoP 的 4:1 换算） */
     private fun playedBytes(): Long {
         val used = usb.ringUsed().toLong()

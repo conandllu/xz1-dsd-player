@@ -49,6 +49,13 @@
 - **起播延迟的真凶是"首块太大"**：数据源冷启动时若一次要 2 MB，465 KB/s 的公网 WebDAV 光等这一块
   就要 4.3 s（表现：切歌/起播 4 秒才出声）。现在冷启动只取 1/4 块（256 KB）并在访问到块尾时补全；
   解码侧单次读源改为 `max(128 KB, 帧长×2)`。
+- **后台线程停止不要用 `interrupt()`**：预读线程里 `Thread.sleep` 收到中断会抛
+  `InterruptedException`，线程没捕获就是 `FATAL EXCEPTION: http-prefetch` → 进程被杀 →
+  "点播放没反应"（真机起播 8 次挂 3 次）。用标志位 + 短 sleep（15 ms）优雅退出，并给整个循环
+  包一层兜底 catch。
+- **起播第一跳只发一次请求**：`Range: 0-(块/4-1)` 同时拿 `Content-Range` 的总长与首块数据，
+  别再用 `Range: 0-0` 只探长度、再单独取首块（公网白白多一个 RTT）。服务器忽略 Range 回 200 时
+  必须**有界读取**，不能把整个文件读进内存。
 - **mediaPlayback 前台服务的通知必须挂 MediaSession**（`MediaStyle` + token），否则系统认为
   "FGS 没绑定会话"（日志 `setFgsIfNoSessionIsLinkedToNotification`），暂停/停止后会回收进程，
   表现就是"停止→立刻再播没反应、intent 丢掉一半"。停止后还保留 60 s 宽限再 `stopSelf()`。
