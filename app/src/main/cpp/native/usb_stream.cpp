@@ -458,8 +458,10 @@ static bool submit_feedback_once() {
                                  on_feedback, nullptr, 100);
         for (int i = 0; i < pkts; ++i) t->iso_packet_desc[i].length = pktLen;
     } else {
-        libusb_fill_interrupt_transfer(t, g_handle, g_ep_fb, g_fb_buf, reqLen,
+        // interrupt 传输一次一个包：长度必须 ≤ wMaxPacketSize，否则 usbfs 直接回 EINVAL
+        libusb_fill_interrupt_transfer(t, g_handle, g_ep_fb, g_fb_buf, pktLen,
                                        on_feedback, nullptr, 0);
+        reqLen = pktLen;
     }
     g_fb_submits.fetch_add(1, std::memory_order_relaxed);
     int rc = libusb_submit_transfer(t);
