@@ -117,6 +117,9 @@ bool probe(int fd, int device_address, StreamInfo* info, std::string* err) {
             int mult = 1;
             uint8_t ep_fb = 0;
             int fb_refresh = 0;
+            int fb_attr = 0;
+            int fb_maxpkt = 4;
+            int fb_interval = 1;
             uint8_t synch_from_out = 0;
             for (uint8_t e = 0; e < alt.bNumEndpoints; ++e) {
                 const libusb_endpoint_descriptor& epd = alt.endpoint[e];
@@ -134,12 +137,21 @@ bool probe(int fd, int device_address, StreamInfo* info, std::string* err) {
                                        epd.bEndpointAddress == synch_from_out)) {
                         ep_fb = epd.bEndpointAddress;
                         fb_refresh = epd.bRefresh;
+                        fb_attr = epd.bmAttributes;
+                        fb_maxpkt = epd.wMaxPacketSize & 0x07FF;
+                        fb_interval = epd.bInterval;
                     }
                 }
             }
             if (ep == 0) continue;
             // 有的固件只在 OUT 的 bSynchAddress 里写反馈端点地址
             if (ep_fb == 0 && synch_from_out != 0) ep_fb = synch_from_out;
+            // 第一百二十七轮：端点身份必须看得见 —— 真机上反馈 URB 回 EIO 时，
+            // 只有把「选中的地址 / 属性 / 包长 / 间隔」打出来才能判断是选错端点还是提交方式错。
+            LOGI("AS alt%d 端点: data=0x%02x maxpkt=%d mult=%d fb=0x%02x(attr=0x%02x maxpkt=%d "
+                 "interval=%d refresh=%d) 数据EP.synchAddr=0x%02x",
+                 alt.bAlternateSetting, ep, mp, mult, ep_fb, fb_attr, fb_maxpkt,
+                 fb_interval, fb_refresh, synch_from_out);
 
             // 解析 CS AS 描述符（统一走 uac2_parse.h，主机侧有对应的单测）
             uac2parse::AltParsed parsed =
@@ -190,6 +202,9 @@ bool probe(int fd, int device_address, StreamInfo* info, std::string* err) {
                     tgt->ep_out = ep;
                     tgt->ep_fb = ep_fb;
                     tgt->fb_refresh = fb_refresh;
+                    tgt->fb_attr = fb_attr;
+                    tgt->fb_maxpkt = fb_maxpkt > 0 ? fb_maxpkt : 4;
+                    tgt->fb_interval = fb_interval;
                     tgt->max_packet = mp;
                     tgt->iso_mult = mult;
                     tgt->subslot = subslot > 0 ? subslot : 4;

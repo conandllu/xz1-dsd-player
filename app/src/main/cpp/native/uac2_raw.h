@@ -45,6 +45,10 @@ struct StreamInfo {
     uint8_t ep_fb = 0;
     /** bRefresh：反馈值每 2^bRefresh 帧刷新一次（0 = 每帧） */
     int fb_refresh = 0;
+    /** 反馈端点的描述符属性（诊断用：UAC2 explicit feedback 通常是 isochronous） */
+    int fb_attr = 0;
+    int fb_maxpkt = 4;
+    int fb_interval = 1;
     uint16_t max_packet = 0;   // wMaxPacketSize 的字节数部分
     int iso_mult = 1;      // 每微帧额外事务数：0=1x 1=2x 2=3x
     int subslot = 3;       // 选中 PCM alt 的子槽

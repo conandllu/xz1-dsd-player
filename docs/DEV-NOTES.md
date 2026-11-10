@@ -166,3 +166,21 @@ adb logcat -s PlaybackService FlacSource FlacFloat HttpFlac StreamByteSource Mp4
   重试时**每次缩小 Range 范围**（大请求卡住后重试同一个大请求只会再卡一次）。
   服务器不支持 Range（回 200 + 整文件）时必须**流式跳过 + 有界读取**，绝不能 `body.bytes()`。
 - 环形缓冲 8 MB（96k/24bit ≈10.4 s）：链路有 10% 丢包 + 秒级停顿时，4 MB 会被瞬间抽干。
+
+## 11. 反馈端点的提交方式（第一百二十七轮，真机踩到的 EIO 真因）
+
+- **反馈端点在描述符里是 isochronous，就必须用 iso transfer 提交**。用
+  `libusb_fill_interrupt_transfer` 打到 iso 端点，usbfs 直接回 `LIBUSB_ERROR_IO`（EIO），
+  看起来像"设备不支持反馈"，实际是提交类型错了。判据：端点描述符 `bmAttributes & 0x03 == 0x01`。
+  现在按属性选类型，失败时 iso / interrupt 轮流各试（有些固件两者都吃）。
+- **`libusb_alloc_transfer(n)` 的 n 必须预留够 iso 包数**：`libusb_fill_iso_transfer` 只写
+  `iso_packet_desc[]` 不复分配，按 0 分配再填 1 个包就是越界写。反馈端点固定按 1 包分配。
+- **绝不能在任何 libusb 回调里 `sleep` 重试**：回调跑在事件线程上，睡 300 ms 会让音频 URB 全部超时
+  → 满屏欠载 + 「嗞」。重试要改成"置 pending 标志，由**音频 URB 完成回调**按 100 ms 节奏驱动"，
+  并且失败日志要限流（前 3 次 + 每 10 次一条），否则一次重试风暴能刷几百行。
+- **反馈值有两种定点解释，要按合理性选**：UAC2 是 16.16「样本/微帧」（`raw/65536*8000` 帧/秒）；
+  部分固件沿用 UAC1 的 10.14「样本/帧」（`raw/16384*1000` 帧/秒）。两种都算，取落在标称 ±10% 内
+  的那个，都不在内就**退回标称帧率并打 WARN**，绝不把坏反馈灌进帧长计算。
+- **端点身份必须进日志**：`AS altN 端点: data=0x.. fb=0x..(attr/maxpkt/interval/refresh) 数据EP.synchAddr=0x..`。
+  反馈端点有三种来源（usage=01、数据 EP 的 `bSynchAddress`、无描述符只能猜），没有这行日志时，
+  只能看到"反馈 0x81 提交失败"而无法判断是端点选错还是提交方式错。
