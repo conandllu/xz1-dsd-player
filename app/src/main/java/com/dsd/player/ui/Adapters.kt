@@ -55,15 +55,22 @@ class GroupAdapter(
         // 用 INVISIBLE 而不是 GONE：没有副标题的卡片也保持同样高度（走查 #25 卡片高度不一致）
         sub.visibility = if (g.subtitle.isBlank()) View.INVISIBLE else View.VISIBLE
         // 先定封面尺寸，再加载（占位音符的内边距按边长算），最后 Coil 真封面覆盖
-        if (grid) {
-            val size = if (cellSizePx > 0) cellSizePx else (100 * d).toInt()
+        val side = if (grid) {
+            // 布局完成前 cellSizePx 还是 0：兜底按"屏宽 / 列数"估，绝不用固定 100dp
+            //（那会让封面按 100dp 解码、再被放大到整格 → 真机第一百三十二轮量到锐度只剩 7.7%）
+            val fallback = (holder.root.resources.displayMetrics.widthPixels / 3)
+                .coerceAtLeast((100 * d).toInt())
+            val size = if (cellSizePx > 0) cellSizePx else fallback
             cover.layoutParams = cover.layoutParams.apply { height = size; width = size }
+            size
         } else {
             // 列表形态的尺寸由 item_album_list.xml 固定（52dp 方形），这里不再改
-            val side = (52 * d).toInt()
-            cover.layoutParams = cover.layoutParams.apply { height = side; width = side }
+            val px = (52 * d).toInt()
+            cover.layoutParams = cover.layoutParams.apply { height = px; width = px }
+            px
         }
-        Artwork.load(cover, g.albumId)
+        // ★ 显式给解码尺寸（Coil 用视图尺寸推会在"尚未测量"时退化）
+        Artwork.load(cover, g.albumId, side)
         holder.root.setOnClickListener { onOpen(g) }
         holder.root.setOnLongClickListener { onPlayAll(g); true }
     }

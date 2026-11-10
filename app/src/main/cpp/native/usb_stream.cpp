@@ -101,6 +101,16 @@ std::atomic<long long> g_fb_last_raw{0};     // 最近一次原始值
 std::atomic<int> g_fb_last_len{0};           // 最近一次实际字节数
 std::atomic<long long> g_fb_nominal_seen{0}; // 最近一次折算出的标称对比（fps）
 std::atomic<bool> g_fb_no_device{false};     // 设备已消失：别再重试
+// ── 口径对齐（真机第一百三十一轮把"实发偏负"误读成码率少发，其实两个时钟域不同）──
+// 我们的发送节奏由**USB 微帧**驱动（1 包 = 1 微帧，与主机控制器时钟同步），
+// 而"每秒应发多少"是拿手机 CPU 的 CLOCK_MONOTONIC 算的。两者相差几 ppm~上百 ppm 很正常，
+// 所以必须同时打印"USB 微帧数 vs 壁钟毫秒"，否则 ppm 对账没有意义。
+std::atomic<long long> g_packets{0};          // 已提交的等时包数（= 微帧数）
+std::atomic<long long> g_frames_asked{0};     // compute_lengths 算出的帧数（累计）
+std::atomic<long long> g_start_ms{0};         // 开流时刻（CLOCK_MONOTONIC 毫秒）
+// 反馈值低通：每次完成覆盖 8 微帧 = 1 ms，alpha = 1ms / 500ms
+constexpr double kFbSmoothAlpha = 0.002;
+double g_fb_smooth = 0.0;                     // 仅事件线程读写
 
 std::vector<libusb_transfer*> g_xfers;
 std::vector<std::vector<uint8_t>> g_bufs;
@@ -119,6 +129,7 @@ libusb_device_handle* g_handle = nullptr;
  */
 static int compute_lengths(libusb_transfer* x) {
     long long acc = g_acc.load(std::memory_order_relaxed);
+    long long framesSum = 0;
     // 有反馈就用反馈换算出的帧率（已 clamp 到 ±2%），没有就用标称值
     long long fps = g_fps_eff.load(std::memory_order_relaxed);
     if (fps <= 0) fps = g_frames_per_sec;
@@ -135,8 +146,11 @@ static int compute_lengths(libusb_transfer* x) {
         }
         x->iso_packet_desc[i].length = (int)len;
         total += (int)len;
+        framesSum += frames;
     }
     g_acc.store(acc, std::memory_order_relaxed);
+    g_packets.fetch_add(kPktsPerXfer, std::memory_order_relaxed);
+    g_frames_asked.fetch_add(framesSum, std::memory_order_relaxed);
     return total;
 }
 
@@ -366,7 +380,12 @@ static void on_feedback(libusb_transfer* t) {
             bool ok_1014 = v_1014 > n * 0.9 && v_1014 < n * 1.1;
             double pick = ok_1616 ? v_1616 : (ok_1014 ? v_1014 : -1.0);
             if (pick > 0) {
-                long long fps = (long long)(pick + 0.5);
+                // 一阶低通（时间常数 ≈0.5 s）：设备给的是量化过的值
+                //（真机 96k 上只有 0xbfff8 / 0xc0000 两种，1 LSB ≈ 1.27 ppm，跳一次 ≈10 ppm），
+                //直接拿单次值当目标会让调速来回横跳。平滑后再取整成整数帧/秒。
+                g_fb_smooth = (g_fb_smooth <= 0.0) ? pick
+                                                   : g_fb_smooth + (pick - g_fb_smooth) * kFbSmoothAlpha;
+                long long fps = (long long)(g_fb_smooth + 0.5);
                 long long lo = nominal - nominal / 50;        // -2%
                 long long hi = nominal + nominal / 50;        // +2%
                 if (fps < lo) fps = lo;
@@ -407,17 +426,38 @@ static void on_feedback(libusb_transfer* t) {
                 if (nominalFrames > 0.0)
                     ppm = (actualFrames - nominalFrames) * 1e6 / nominalFrames;
             }
-            LOGI("反馈汇总 %.0fs：提交 %lld / 完成 %lld（0字节 %lld，有值 %lld），"
-                 "最近 raw=0x%llx (len=%d)；采用 %lld 帧/秒，实发 %.0f 帧（标称 %.0f，%+.1f ppm）；"
-                 "环 %lldKB",
+            // 双时钟口径：发送节奏由 USB 微帧驱动，而"标称"是拿 CPU 壁钟算的。
+            // 两者差几 ppm~上百 ppm 都很正常，不把这两个数同时打出来，"实发 ppm" 无法解释。
+            long long pkts = g_packets.load(std::memory_order_relaxed);
+            long long startMs = g_start_ms.load(std::memory_order_relaxed);
+            double ufPpm = 0.0;
+            if (startMs > 0) {
+                long long wallMs = now - startMs;
+                long long uf = pkts;                        // 1 包 = 1 微帧
+                double expUf = (double)wallMs * 8.0;
+                if (expUf > 0.0) ufPpm = ((double)uf - expUf) * 1e6 / expUf;
+            }
+            long long asked = g_frames_asked.load(std::memory_order_relaxed);
+            long long sent = g_frame_bytes > 0
+                    ? (long long)(g_bytes.load(std::memory_order_relaxed) / g_frame_bytes) : 0;
+            LOGI("反馈汇总 %.1fs：提交 %lld / 完成 %lld（0字节 %lld，有值 %lld），"
+                 "raw=0x%llx=%lld len=%d 平滑 %.5f 帧/µframe；采用 %lld 帧/秒（%+.1f ppm）｜"
+                 "实发 %.0f 帧（标称 %.0f，%+.1f ppm）｜USB 微帧 %lld（壁钟 %lldms，%+.1f ppm）｜"
+                 "累计 算=%lld 送=%lld 差=%lld｜环 %lldKB",
                  spanMs > 0 ? spanMs / 1000.0 : 30.0,
                  (long long)g_fb_submits.load(std::memory_order_relaxed),
                  (long long)g_fb_dones.load(std::memory_order_relaxed),
                  (long long)g_fb_zero.load(std::memory_order_relaxed),
                  (long long)g_fb_nonzero.load(std::memory_order_relaxed),
                  (long long)g_fb_last_raw.load(std::memory_order_relaxed),
+                 (long long)g_fb_last_raw.load(std::memory_order_relaxed),
                  g_fb_last_len.load(std::memory_order_relaxed),
-                 fb > 0 ? fb : nominal, actualFrames, nominalFrames, ppm,
+                 g_fb_smooth > 0.0 ? g_fb_smooth / 8000.0 : 0.0,   // 帧/µframe
+                 fb > 0 ? fb : nominal,
+                 nominal > 0 ? ((double)(fb > 0 ? fb : nominal) - (double)nominal) * 1e6 / (double)nominal : 0.0,
+                 actualFrames, nominalFrames, ppm,
+                 pkts, startMs > 0 ? (now - startMs) : 0, ufPpm,
+                 asked, sent, asked - sent,
                  (long long)((head.load(std::memory_order_relaxed) -
                               tail.load(std::memory_order_relaxed)) / 1024));
         }
@@ -506,6 +546,7 @@ static void start_feedback(uint8_t ep, int refresh, int attr, int maxpkt, int in
     g_fb_last_len.store(0);
     g_fb_attempts.store(0);
     g_fb_retry = 0;
+    g_fb_smooth = 0.0;
     if (ep == 0) return;
     // 描述符里是 isochronous（位 0-1 == 1）就先用 iso；否则先试 interrupt
     g_fb_iso = ((attr & 0x03) == 0x01);
@@ -611,6 +652,10 @@ bool start(int fd, const StreamInfo& info, int rate_hz, int frame_bytes,
     g_first_data.store(false);
     g_errors.store(0);
     g_inflight.store(0);
+    g_packets.store(0);
+    g_frames_asked.store(0);
+    g_start_ms.store((long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
 
     // 每秒字节数：
     //   PCM / DoP : rate × frame_bytes（rate 是 USB 采样率）

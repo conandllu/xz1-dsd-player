@@ -490,11 +490,14 @@ class OnlineAdapter(
             is OnlineItem.Album -> {
                 val a = it.album
                 val cover = v.findViewById<ImageView>(R.id.cover)
+                // 兜底边长绝不能是固定 100dp（会让封面按 100dp 解码再放大 → 糊）
+                val gridFallback = (v.resources.displayMetrics.widthPixels / 3)
+                    .coerceAtLeast((100 * d).toInt())
+                val side = if (grid) (cellSizePx.takeIf { it > 0 } ?: gridFallback) else (46 * d).toInt()
                 if (grid) {
-                    val size = if (cellSizePx > 0) cellSizePx else (100 * d).toInt()
-                    cover.layoutParams = cover.layoutParams.apply { width = size; height = size }
+                    cover.layoutParams = cover.layoutParams.apply { width = side; height = side }
                 }
-                loadCover(cover, a.imageUrl, if (grid) (cellSizePx.takeIf { it > 0 } ?: (100 * d).toInt()) else (46 * d).toInt())
+                loadCover(cover, a.imageUrl, side)
                 v.findViewById<TextView>(R.id.title).text = a.title
                 val sub = v.findViewById<TextView>(R.id.subtitle)
                 sub.text = buildString {
@@ -630,7 +633,7 @@ class OnlineAdapter(
         if (url.isBlank()) return
         val req = coil.request.ImageRequest.Builder(iv.context)
             .data(url)
-            .size(sizePx.coerceAtLeast(1))
+            .size(Artwork.targetPx(sizePx))
             .scale(coil.size.Scale.FILL)
             .apply { coverHeaders(url).forEach { (k, v) -> addHeader(k, v) } }
             .target(object : coil.target.Target {

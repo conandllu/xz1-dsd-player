@@ -779,20 +779,36 @@ class MainActivity : AppCompatActivity() {
         // 同一张封面只加载一次。
         // 播放中 renderPlayback() 每 ~120ms 跑一次（进度刷新），每次重设占位 + crossfade
         // 会表现为"专辑图片一直闪"——这是真机上看到的那个 bug 的根因。
+        // ★ 显示边长必须进 key：fitCover() 会在布局后改掉视图尺寸，
+        //   以前 key 里没有尺寸，于是"按 XML 的 260dp 解码、再放大到 476 px 显示"
+        //   （真机第一百三十二轮实测锐度只有参考值的 27.6%）。尺寸变了就重新解码。
+        val viewPx = iv.width.takeIf { it > 0 } ?: iv.height.takeIf { it > 0 } ?: 0
         val key = when {
             cover.startsWith("http") || cover.startsWith("file") ->
-                "$cover|${PlayerBus.trackCoverHeaders.size}"
-            else -> "album:${currentAlbumId()}"
+                "$cover|${PlayerBus.trackCoverHeaders.size}|$viewPx"
+            else -> "album:${currentAlbumId()}|$viewPx"
         }
         if (iv.tag == key) return
         iv.tag = key
         android.util.Log.i("Artwork", "load $key（视图 ${iv.id}）")
+        if (viewPx == 0) {
+            // 还没布局：装一次性布局监听，等真正测量完再按真实尺寸加载
+            //（只 post 一次不够 —— 那一刻 width 常常仍是 0，之后就再没人唤醒了）
+            if (iv.getTag(R.id.cover) == null) {
+                iv.setTag(R.id.cover, true)
+                iv.addOnLayoutChangeListener { v, l, t, r, b, ol, ot, or, ob ->
+                    if (r - l > 0 && (r - l) != (or - ol)) loadArtwork(v as ImageView)
+                }
+            }
+            iv.post { if (iv.width > 0) loadArtwork(iv) }
+        }
         if (cover.startsWith("http") || cover.startsWith("file")) {
             Artwork.placeholder(iv)
-            val px = iv.layoutParams?.height?.takeIf { it > 0 }
-                ?: (160 * resources.displayMetrics.density).toInt()
+            val px = if (viewPx > 0) viewPx
+                     else (iv.layoutParams?.height?.takeIf { it > 0 }
+                         ?: (160 * resources.displayMetrics.density).toInt())
             iv.load(cover) {
-                size(px)
+                size(Artwork.targetPx(px), Artwork.targetPx(px))
                 scale(coil.size.Scale.FILL)
                 crossfade(120)
                 // WebDAV 的封面图同样需要 Basic 认证（Qobuz/本地为空 map，不影响）
