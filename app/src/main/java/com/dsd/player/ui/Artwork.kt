@@ -102,7 +102,7 @@ object Artwork {
                     Thread {
                         val scaled = BoxScale.boxScale(src, side)
                         cache.put(key, scaled)
-                        if (BuildConfig.DEBUG) dumpDebug(iv, scaled, src, side)
+                        if (BuildConfig.DEBUG) dumpDebug(iv, scaled, src, side, tag)
                         iv.post {
                             val still = synchronized(pending) { pending[iv] } == key
                             if (!still) return@post          // 视图已被复用
@@ -126,9 +126,12 @@ object Artwork {
      * 调试图落盘（debug 包）：`cacheDir/cover_debug_<边长>.png`。
      * 真机复测时可以直接把这张样张取出来和源图比对，不用再猜"BOX 有没有生效"。
      */
-    private fun dumpDebug(iv: ImageView, out: Bitmap, src: Bitmap, side: Int) {
+    private fun dumpDebug(iv: ImageView, out: Bitmap, src: Bitmap, side: Int, tag: String) {
         try {
-            val f = File(iv.context.cacheDir, "cover_debug_$side.png")
+            // 文件名带上专辑标识：否则不同专辑互相覆盖，真机复测时分不清样张是哪一张
+            val safe = tag.filter { it.isLetterOrDigit() || it == '-' || it == '_' }.takeLast(24)
+            val name = if (safe.isEmpty()) "cover_debug_$side.png" else "cover_debug_${safe}_$side.png"
+            val f = File(iv.context.cacheDir, name)
             FileOutputStream(f).use { out.compress(Bitmap.CompressFormat.PNG, 100, it) }
             Log.i(
                 "Artwork",

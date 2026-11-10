@@ -201,6 +201,15 @@ adb logcat -s PlaybackService FlacSource FlacFloat HttpFlac StreamByteSource Mp4
 - 累加器改成**毫帧单位**：`acc += fps_x1000; frames = acc / 8000000; acc %= 8000000;`
   长期均值严格等于小数目标，且仍是整数 delta-sigma（不会有浮点累积误差）。
 
+## 11h. 统计口径：所有"送出"计数必须在同一处记账（第一百三十六轮）
+
+- `start()` 里预填的 `kXfers` 个静音 URB 也要计入 `g_bytes/g_submitted`：它们的帧数已经进
+  `compute_lengths()` 的累加器（因此算进了 `g_frames_asked`），不补记就会让「累计 算−送」
+  **恒定差 kXfers 个 URB**（96k 下 = 6×96 = 576 帧；真机两轮都看到这个固定偏移）。
+- 判据要看**窗口 Δ差**（每窗口变化量，恒 0 才健康），绝对值可能是启动期的固定偏移。
+- 微帧口径用**完成 URB 数 × 每 URB 包数**，并且只能是窗口增量：30 s 窗口的时间戳分辨率是 1 ms，
+  ±1 个 URB = ±33 ppm，所以读到的 ±100 ppm 属于测量噪声，不能当"时钟错了"用。
+
 ## 11g. 音频 URB 提交失败绝不能丢（第一百三十五轮：`累计 算−送 = 576` 的真身）
 
 - `libusb_submit_transfer` 失败时若直接 `return`，那 1 ms 音频就**消失**了 —— 对 DAC 就是一次断点，

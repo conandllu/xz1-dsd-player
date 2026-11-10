@@ -112,6 +112,7 @@ std::atomic<long long> g_start_ms{0};         // 开流时刻（CLOCK_MONOTONIC 
 // 加 5 ppm（真机第一百三十四轮实测"采用 96000（+0.0 ppm）"就是这么来的）。
 std::atomic<long long> g_fps_x1000{0};        // 0 = 用标称值
 std::atomic<long long> g_submit_fails{0};     // 音频 URB 提交失败次数
+std::atomic<long long> g_urbs_done{0};        // 完成的音频 URB 数（×kPktsPerXfer = 微帧）
 std::atomic<int> g_submit_fail_last{0};       // 最近一次失败的 libusb 错误码
 /** 提交失败的 URB：留在这里由下一次完成回调重新武装（丢掉 1 ms 音频 = 一次可闻的断点） */
 std::atomic<bool> g_xfer_down[kXfers] = {};
@@ -343,6 +344,7 @@ void on_done(libusb_transfer* xfer) {
         g_inflight.fetch_sub(1);
         return;
     }
+    g_urbs_done.fetch_add(1, std::memory_order_relaxed);
     maybe_retry_feedback();
     if (xfer->status != LIBUSB_TRANSFER_COMPLETED) {
         g_errors.fetch_add(1, std::memory_order_relaxed);
@@ -386,6 +388,9 @@ static void on_feedback(libusb_transfer* t) {
     static std::atomic<long long> last_sum_ms{0};
     static std::atomic<long long> sum_bytes0{0};
     static std::atomic<long long> win_pkts0{0};
+    static std::atomic<long long> win_urbs0{0};
+    static std::atomic<long long> win_diff0{0};
+    static std::atomic<long long> win_bytes0{0};
     static std::atomic<long long> sum_ms0{0};
     auto now_ms = [] {
         return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -505,6 +510,8 @@ static void on_feedback(libusb_transfer* t) {
                  nominal > 0 ? ((double)g_fps_x1000.load(std::memory_order_relaxed) / 1000.0
                                 - (double)nominal) * 1e6 / (double)nominal : 0.0);
             // 窗口内的微帧增量 vs 壁钟时长：常量偏移（例如开流瞬间）不会污染 ppm
+            long long bytesNow = g_bytes.load(std::memory_order_relaxed);
+            long long bytesWin = bytesNow - win_bytes0.exchange(bytesNow, std::memory_order_relaxed);
             long long pkts0 = win_pkts0.exchange(pkts, std::memory_order_relaxed);
             double winPktPpm = 0.0;
             long long winMs = spanMs;
@@ -516,12 +523,20 @@ static void on_feedback(libusb_transfer* t) {
             long long winN = g_win_n;
             g_win_sum_fps = 0.0;
             g_win_n = 0;
-            LOGI("反馈汇总B：累计 算=%lld 送=%lld 差=%lld（微帧口径，应为 0）｜"
-                 "窗口微帧 %lld（壁钟 %lldms，%+.1f ppm）｜每微帧实发 %.6f 帧（目标 %.6f）｜"
-                 "窗口均值 %.3f 帧/秒（%+.1f ppm，%lld 个样本）｜提交失败 %lld（%s）｜环 %lldKB",
-                 asked, sent, asked - sent,
-                 pkts - pkts0, winMs, winPktPpm,
-                 pkts > 0 ? (double)sent / (double)pkts : 0.0,
+            long long urbs = g_urbs_done.load(std::memory_order_relaxed);
+            long long urbsWin = urbs - win_urbs0.exchange(urbs, std::memory_order_relaxed);
+            long long ufWin = urbsWin * kPktsPerXfer;          // 1 URB = kPktsPerXfer 微帧
+            long long diffNow = asked - sent;
+            long long diffDelta = diffNow - win_diff0.exchange(diffNow, std::memory_order_relaxed);
+            double winSentPerUf = (ufWin > 0 && bytesWin > 0)
+                    ? (bytesWin / (double)g_frame_bytes) / (double)ufWin : 0.0;
+            LOGI("反馈汇总B：累计 算=%lld 送=%lld 差=%lld（Δ=%lld/窗口，应恒为 0）｜"
+                 "窗口完成 URB %lld（微帧 %lld，壁钟 %lldms，%+.1f ppm）｜"
+                 "窗口每微帧实发 %.6f 帧（目标 %.6f）｜窗口均值 %.3f 帧/秒（%+.1f ppm，%lld 样本）｜"
+                 "提交失败 %lld（%s）｜环 %lldKB",
+                 asked, sent, diffNow, diffDelta,
+                 urbsWin, ufWin, winMs, winPktPpm,
+                 winSentPerUf,
                  (double)g_fps_x1000.load(std::memory_order_relaxed) / 8000000.0,
                  winMean,
                  nominal > 0 ? (winMean - (double)nominal) * 1e6 / (double)nominal : 0.0,
@@ -782,6 +797,11 @@ bool start(int fd, const StreamInfo& info, int rate_hz, int frame_bytes,
             return false;
         }
         g_inflight.fetch_add(1);
+        // ★ 这 6 个预填 URB 的帧数在上面的 compute_lengths 里已经计入 g_frames_asked/g_packets，
+        //   这里必须同样计入"送出"，否则「累计 算 − 送」会永远差 kXfers 个 URB
+        //   （真机第一百三十五轮看到的恒定 576 帧 = 6 × 96 帧 @96k 就是这个）。
+        g_submitted.fetch_add(1);
+        g_bytes.fetch_add(total, std::memory_order_relaxed);
     }
     g_running = true;
     // 反馈端点必须在 g_running=true 之后挂，回调里会立刻重新提交
