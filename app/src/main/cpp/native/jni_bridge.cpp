@@ -146,6 +146,11 @@ Java_com_dsd_player_usb_NativeBridge_nativeSeekFlushBlocking(JNIEnv*, jobject, j
     return usbaudio::seek_flush_blocking(timeoutMs) ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jlong JNICALL
+Java_com_dsd_player_usb_NativeBridge_nativeSeekGeneration(JNIEnv*, jobject) {
+    return (jlong)usbaudio::seek_generation();
+}
+
 JNIEXPORT jint JNICALL
 Java_com_dsd_player_usb_NativeBridge_nativeRingWrite(JNIEnv* env, jobject, jbyteArray data,
                                                      jint off, jint len) {

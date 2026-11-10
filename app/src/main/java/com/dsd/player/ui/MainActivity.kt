@@ -812,9 +812,17 @@ class MainActivity : AppCompatActivity() {
                 iv, android.net.Uri.parse(cover), px,
                 PlayerBus.trackCoverHeaders, "track:$cover"
             )
+            if (viewPx == 0) {
+                // 还没布局：等真实宽度出来再按它解码（同时也会替换上面的估算结果）
+                Artwork.loadAuto(
+                    iv, android.net.Uri.parse(cover), PlayerBus.trackCoverHeaders, "track:$cover"
+                )
+            }
             return
         }
-        Artwork.load(iv, currentAlbumId())
+        val albumUri = Artwork.albumArtUri(currentAlbumId())
+        if (albumUri != null) Artwork.loadAuto(iv, albumUri, emptyMap(), "album:${currentAlbumId()}")
+        else Artwork.placeholder(iv)
     }
 
     /** 暂停/恢复：优先同进程直调（无延迟），退化为 Intent；from 用于日志区分入口 */

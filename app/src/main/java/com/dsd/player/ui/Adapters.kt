@@ -69,8 +69,11 @@ class GroupAdapter(
             cover.layoutParams = cover.layoutParams.apply { height = px; width = px }
             px
         }
-        // ★ 显式给解码尺寸（Coil 用视图尺寸推会在"尚未测量"时退化）
-        Artwork.load(cover, g.albumId, side)
+        // ★ 解码尺寸取**视图测量宽度**（公式算出来的 cellSizePx 与真实布局会差 35px，
+        //   导致"生成 240 却显示在 205 的格子" —— 真机第一百三十七轮实测）
+        val artUri = Artwork.albumArtUri(g.albumId)
+        if (artUri != null) Artwork.loadAuto(cover, artUri, emptyMap(), "album:${g.albumId}")
+        else Artwork.placeholder(cover)
         holder.root.setOnClickListener { onOpen(g) }
         holder.root.setOnLongClickListener { onPlayAll(g); true }
     }

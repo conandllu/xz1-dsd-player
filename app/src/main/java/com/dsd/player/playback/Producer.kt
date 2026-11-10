@@ -174,12 +174,20 @@ class Producer(
                 Log.i(TAG, "drain: 剩余水位 $used（起 $enter），已用 ${now - t0}ms，" +
                     "xfer=${st[0]} bytes=${st[1]} underrun=${st[2]} err=${st[3]}")
             }
-            // 水位 1 秒不动 = 泵没在消费，直接报出来（真机排查用）
+            // 水位 1 秒不动 = 泵没在消费 → 报出来；**连续 2 秒不动就放弃 drain**。
+            // 真机第一百三十八轮就是死在这里：列表循环重播时两次并发 seek 把泵带成
+            // "只发静音、不读环"的中间态，drain 等环清空永远等不到 → 卡住 55 秒。
+            // 环里的数据此时注定要被丢弃（马上要重播/切歌），直接退出比挂死强。
             if (stalledSince != 0L && now - stalledSince > 1000) {
                 val st = usb.stats()
+                if (now - stalledSince > 2000) {
+                    Log.w(TAG, "drain: 水位 2s 未变化（泵不再消费）→ 放弃等待，丢弃剩余 " +
+                        "${used / 1024}KB（xfer=${st[0]} bytes=${st[1]}）")
+                    runCatching { usb.ringDiscard() }
+                    break
+                }
                 Log.w(TAG, "drain: 水位 1s 未变化（pump 可能已停）：ringUsed=$used " +
                     "xfer=${st[0]} bytes=${st[1]} underrun=${st[2]} err=${st[3]}")
-                stalledSince = now          // 再等 1 秒才重复报
             }
             try { Thread.sleep(20) } catch (ie: InterruptedException) { break }
         }

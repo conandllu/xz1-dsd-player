@@ -221,21 +221,42 @@ class UsbAudioOutput(private val onError: (String) -> Unit) {
         return ncfg
     }
 
-    /** 暂停：泵改送静音并清空缓冲（不再"把剩下的播完"） */
+    /**
+     * 泵控制串行化闸门。
+     *
+     * 真机第一百三十八轮：列表循环重播时，工作线程（28680）与生产者线程（30680）在 6 ms 内
+     * 各调了一次 `seekFlush()`+淡入，native 侧交错成「淡出→丢弃→淡入→再淡出」，
+     * 最终停在"只发静音、不读环"的中间态 → drain 等环清空永远等不到，卡死 55 秒。
+     * 泵的淡入/淡出/丢弃是**跨微帧序列**，必须整体串行，不能被两个线程各插一半。
+     */
+    private val pumpLock = Any()
+
+    /** 暂停：泵改送静音（淡出后不再读环） */
     fun pauseOutput() {
-        runCatching { NativeBridge.nativeSetMute(true) }
+        synchronized(pumpLock) { runCatching { NativeBridge.nativeSetMute(true) } }
     }
 
-    /** 恢复：清掉残留数据后继续 */
-    fun resumeOutput() {
-        // 不要 ringReset：buffer 里是"尚未播放"的音频，保留才能从原位置继续
-        runCatching { NativeBridge.nativeSetMute(false) }
+    /** 恢复/淡入：只在**没有**更新的 seek 请求时才真的淡入（世代号校验） */
+    fun resumeOutput() = ensureUnmuted()
+
+    /**
+     * 确保未被静音。
+     *
+     * @param seekGen 调用方预填前拿到的世代号；若期间有新的 seek 请求进来（世代变了），
+     *                这次淡入就是过期指令，直接丢弃 —— 否则会把"别人刚做的淡出"盖掉。
+     */
+    fun ensureUnmuted(seekGen: Long = -1L) {
+        synchronized(pumpLock) {
+            if (seekGen >= 0 && seekGeneration() != seekGen) {
+                Log.w(TAG, "ensureUnmuted：世代已变（$seekGen → ${seekGeneration()}），丢弃过期淡入")
+                return
+            }
+            runCatching { NativeBridge.nativeSetMute(false) }
+        }
     }
 
-    /** 确保未被静音（切歌/重开后强制回到增益 1，避免"点播放走淡出"的状态错位） */
-    fun ensureUnmuted() {
-        runCatching { NativeBridge.nativeSetMute(false) }
-    }
+    /** 当前 seek 世代号（每次 seek 请求 +1） */
+    fun seekGeneration(): Long = runCatching { NativeBridge.nativeSeekGeneration() }.getOrDefault(0L)
 
     /**
      * seek / 切歌后冲刷环形缓冲（旧位置数据必须丢弃，否则会先把旧声音播完 ≈3 s）。
@@ -246,7 +267,10 @@ class UsbAudioOutput(private val onError: (String) -> Unit) {
      */
     fun seekFlush(timeoutMs: Int = 200) {
         val t0 = System.nanoTime()
-        val ok = runCatching { NativeBridge.nativeSeekFlushBlocking(timeoutMs) }.getOrDefault(true)
+        // ★ 串行化：并发 seek 是第一百三十八轮死锁的直接成因（两个线程各插一半出不来）
+        val ok = synchronized(pumpLock) {
+            runCatching { NativeBridge.nativeSeekFlushBlocking(timeoutMs) }.getOrDefault(true)
+        }
         val ms = (System.nanoTime() - t0) / 1_000_000
         if (!ok) Log.w(TAG, "seekFlush：等待淡出超时 ${ms}ms（已强制丢弃）")
         else if (ms > 30) Log.i(TAG, "seekFlush：丢弃完成用了 ${ms}ms")
@@ -295,6 +319,9 @@ class UsbAudioOutput(private val onError: (String) -> Unit) {
         // PCM 源：始终按原率走 24-in-32 PCM；DOP/NATIVE 对 PCM 无意义
         return StreamConfig(OutputMode.PCM, info.sampleRate, 8, info.sampleRate, false)
     }
+
+    /** 丢弃"尚未播放"的数据（读指针追平写指针）：drain 超时逃生用 */
+    fun ringDiscard() = runCatching { NativeBridge.nativeRingDiscard() }
 
     fun stats(): LongArray = NativeBridge.nativeStats()
     fun ringUsed(): Int = NativeBridge.nativeRingUsed()

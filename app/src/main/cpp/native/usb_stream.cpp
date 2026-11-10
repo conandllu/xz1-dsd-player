@@ -113,6 +113,11 @@ std::atomic<long long> g_start_ms{0};         // 开流时刻（CLOCK_MONOTONIC 
 std::atomic<long long> g_fps_x1000{0};        // 0 = 用标称值
 std::atomic<long long> g_submit_fails{0};     // 音频 URB 提交失败次数
 std::atomic<long long> g_urbs_done{0};        // 完成的音频 URB 数（×kPktsPerXfer = 微帧）
+std::atomic<long long> g_win_frames_min{1LL << 30};   // 本窗口每包最小帧数
+std::atomic<long long> g_win_frames_max{0};           // 本窗口每包最大帧数
+/** seek 世代号：每次 seek 请求 +1。上层"预填完再淡入"这类延迟指令要带世代号回来校验，
+ *  否则并发 seek 时会把别人刚做的淡出盖掉（真机第一百三十八轮的死锁）。 */
+std::atomic<long long> g_seek_gen{0};
 std::atomic<int> g_submit_fail_last{0};       // 最近一次失败的 libusb 错误码
 /** 提交失败的 URB：留在这里由下一次完成回调重新武装（丢掉 1 ms 音频 = 一次可闻的断点） */
 std::atomic<bool> g_xfer_down[kXfers] = {};
@@ -143,6 +148,7 @@ static int compute_lengths(libusb_transfer* x) {
     //   取整成 96000 会凭空多送 5 ppm（真机第一百三十四轮就是踩这个：采用 96000 / +0.0 ppm）。
     long long acc = g_acc.load(std::memory_order_relaxed);
     long long framesSum = 0;
+    long long framesMin = 1LL << 30, framesMax = 0;
     // 有反馈就用反馈换算出的速率（已 clamp 到 ±2%），没有就用标称值
     long long fpsx = g_fps_x1000.load(std::memory_order_relaxed);
     if (fpsx <= 0) fpsx = (long long)g_frames_per_sec * 1000LL;
@@ -160,10 +166,19 @@ static int compute_lengths(libusb_transfer* x) {
         x->iso_packet_desc[i].length = (int)len;
         total += (int)len;
         framesSum += frames;
+        if (frames < framesMin) framesMin = frames;
+        if (frames > framesMax) framesMax = frames;
     }
     g_acc.store(acc, std::memory_order_relaxed);
     g_packets.fetch_add(kPktsPerXfer, std::memory_order_relaxed);
     g_frames_asked.fetch_add(framesSum, std::memory_order_relaxed);
+    // 记录本窗口"每包帧数区间"：这才是"帧数有没有真的在抖"的直接证据
+    {
+        long long mn = g_win_frames_min.load(std::memory_order_relaxed);
+        while (framesMin < mn && !g_win_frames_min.compare_exchange_weak(mn, framesMin)) {}
+        long long mx = g_win_frames_max.load(std::memory_order_relaxed);
+        while (framesMax > mx && !g_win_frames_max.compare_exchange_weak(mx, framesMax)) {}
+    }
     return total;
 }
 
@@ -533,7 +548,7 @@ static void on_feedback(libusb_transfer* t) {
             LOGI("反馈汇总B：累计 算=%lld 送=%lld 差=%lld（Δ=%lld/窗口，应恒为 0）｜"
                  "窗口完成 URB %lld（微帧 %lld，壁钟 %lldms，%+.1f ppm）｜"
                  "窗口每微帧实发 %.6f 帧（目标 %.6f）｜窗口均值 %.3f 帧/秒（%+.1f ppm，%lld 样本）｜"
-                 "提交失败 %lld（%s）｜环 %lldKB",
+                 "包长区间 %lld..%lld 帧｜提交失败 %lld（%s）｜环 %lldKB",
                  asked, sent, diffNow, diffDelta,
                  urbsWin, ufWin, winMs, winPktPpm,
                  winSentPerUf,
@@ -541,6 +556,8 @@ static void on_feedback(libusb_transfer* t) {
                  winMean,
                  nominal > 0 ? (winMean - (double)nominal) * 1e6 / (double)nominal : 0.0,
                  winN,
+                 (long long)g_win_frames_min.exchange(1LL << 30, std::memory_order_relaxed),
+                 (long long)g_win_frames_max.exchange(0, std::memory_order_relaxed),
                  (long long)g_submit_fails.load(std::memory_order_relaxed),
                  libusb_error_name(g_submit_fail_last.load(std::memory_order_relaxed)),
                  (long long)((head.load(std::memory_order_relaxed) -
@@ -822,11 +839,17 @@ bool start(int fd, const StreamInfo& info, int rate_hz, int frame_bytes,
             if (f < flo) flo = f;
             if (f > fhi) fhi = f;
         }
-        LOGI("泵启动: %d xfers × %d pkts, %.4f 帧/µframe (%ld..%ld 帧 = %ld..%ld B), rate %d, %s, frame=%dB, 反馈端点=%s",
+        LOGI("泵启动: %d xfers × %d pkts, 标称 %.4f 帧/µframe (%ld..%ld 帧 = %ld..%ld B), rate %d, %s, frame=%dB, 反馈端点=%s",
              kXfers, kPktsPerXfer, (double)g_frames_per_sec / 8000.0,
              flo, fhi, flo * g_frame_bytes, fhi * g_frame_bytes,
              rate_hz, dsd_mode ? "DSD" : "PCM", g_frame_bytes,
              info.ep_fb ? "有（异步，按反馈调帧数）" : "无（同步，按标称值）");
+        if (info.ep_fb) {
+            // 有反馈端点时真正决定帧长的是反馈值（真机第一百三十七轮 §3 提出）
+            LOGI("泵启动: 帧数由反馈决定（收到反馈前按标称 %.4f 帧/µframe 跑）；"
+                 "「反馈汇总B」的「包长区间 a..b 帧」才是实际抖动范围",
+                 (double)g_frames_per_sec / 8000.0);
+        }
     }
     return true;
 }
@@ -883,6 +906,8 @@ void stop() {
 
 bool is_running() { return g_running; }
 
+long long seek_generation() { return g_seek_gen.load(std::memory_order_relaxed); }
+
 /**
  * seek 后冲刷缓冲：旧位置的数据必须丢掉，否则会先把缓冲里剩下的旧声音播完（≈3 s）。
  * PCM 走"淡出 → 丢弃 → 淡入"，避免丢弃瞬间的波形跳变；DSD/DoP 直接丢。
@@ -915,6 +940,7 @@ void seek_flush() {
  * @return true=已丢弃；false=超时（调用方仍会继续，但会记一条 warn）
  */
 bool seek_flush_blocking(int timeout_ms) {
+    g_seek_gen.fetch_add(1, std::memory_order_relaxed);   // 一次 seek 请求 = 一个世代
     if (!g_running) { ring_discard(); return true; }
     seek_flush();                       // 置 pending + 目标 gain=0（DSD/DoP 在这里已直接丢弃）
     if (!g_pending_discard.load(std::memory_order_relaxed)) return true;

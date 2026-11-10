@@ -201,6 +201,25 @@ adb logcat -s PlaybackService FlacSource FlacFloat HttpFlac StreamByteSource Mp4
 - 累加器改成**毫帧单位**：`acc += fps_x1000; frames = acc / 8000000; acc %= 8000000;`
   长期均值严格等于小数目标，且仍是整数 delta-sigma（不会有浮点累积误差）。
 
+## 11i. 泵控制必须串行 + 世代号（第一百三十八轮：列表循环重播死锁）
+
+- 真机死锁现场：工作线程与生产者线程在 6 ms 内各调一次 `seekFlush()`+淡入，native 侧交错成
+  「淡出→丢弃→淡入→再淡出」，泵停在**只发静音、不读环**的中间态；`Producer.drainRing()`
+  等环清空永远等不到 → 界面 PLAYING、位置冻结 55 秒，无任何报错。
+- 三条修法（缺一不可）：① `UsbAudioOutput.pumpLock` 把 seek/静音序列整体串行化；
+  ② native 每次 seek 递增 `g_seek_gen`，"预填完再淡入"必须带世代号回来校验，过期就丢弃；
+  ③ `drainRing()` 连续 2 s 水位不变就**放弃等待并丢弃剩余环**（环里的数据注定要丢）。
+- 另外补：`PLAY` 不带参数时按当前队列/曲目恢复（以前什么都不做，STOP 后按播放没反应）；
+  以及 `state=PLAYING` 但位置 3 s 不推进 → W 日志 + 自动救援（ensureUnmuted → 重开流 → 报错停止）。
+
+## 11j. 封面解码尺寸要取"视图测量宽度"，且落盘样张 = 视图尺寸（第一百三十七轮）
+
+- 公式算出来的格子边长永远追不上真实布局（RecyclerView padding/margins/装饰），真机上算出 240
+  而实际格子 205 → 240 的位图画进 205（屏幕锐度停在理想值的 82%，而样张本身已 92%）。
+- 做法：`Artwork.loadAuto()` 先把请求挂起，`addOnLayoutChangeListener` 拿到**测量宽度**再解码；
+  应用结果前再校验一次 `iv.width == side`，不等就按新宽度重来（布局常在 100 ms 内二次测量）。
+- 屏幕值 ≈ 样张值 × 0.83~0.89（渲染/合成阶段的面板损失，与解码无关）。
+
 ## 11h. 统计口径：所有"送出"计数必须在同一处记账（第一百三十六轮）
 
 - `start()` 里预填的 `kXfers` 个静音 URB 也要计入 `g_bytes/g_submitted`：它们的帧数已经进

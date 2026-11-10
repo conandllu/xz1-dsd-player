@@ -51,6 +51,9 @@ object NativeBridge {
     external fun nativeAlacClose(handle: Long)
     /** 阻塞版：返回时缓冲已丢弃（不含淡入）；返回 false 表示等淡出超时（已强制丢弃） */
     external fun nativeSeekFlushBlocking(timeoutMs: Int): Boolean
+
+    /** seek 世代号：每次 seek 请求 +1，用来丢弃"过期淡入"这类迟到的泵指令 */
+    external fun nativeSeekGeneration(): Long
     external fun nativeRingFree(): Int
     external fun nativeRingUsed(): Int
     external fun nativeRingWrite(data: ByteArray, off: Int, len: Int): Int

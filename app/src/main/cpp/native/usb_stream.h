@@ -35,6 +35,8 @@ void seek_flush();
  * 调用方必须先等它返回，再发 set_mute(false)，否则淡入会覆盖淡出、旧数据不丢。
  */
 bool seek_flush_blocking(int timeout_ms);
+/** seek 世代号（每次 seek 请求 +1），用于丢弃过期淡入 */
+long long seek_generation();
 
 struct Stats {
     long submitted;

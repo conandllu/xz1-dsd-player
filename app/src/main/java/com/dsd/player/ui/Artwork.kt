@@ -37,6 +37,12 @@ object Artwork {
     /** 视图 → 本次请求的 key（复用视图时丢弃旧结果，避免"串图"） */
     private val pending = WeakHashMap<ImageView, String>()
 
+    /** 视图 → 等待布局完成后要加载的请求（"按测量宽度定尺寸"用） */
+    private class AutoReq(val uri: Uri, val headers: Map<String, String>, val tag: String)
+    private val autoReqs = WeakHashMap<ImageView, AutoReq>()
+    private val autoHooked = WeakHashMap<ImageView, Boolean>()
+    private const val AUTO_TAG_ID_KEY = 0x0D5D0001   // 复用 R.id.cover（见 MainActivity 也用同一槽位）
+
     fun albumArtUri(albumId: Long): Uri? =
         if (albumId > 0L) Uri.parse("content://media/external/audio/albumart/$albumId") else null
 
@@ -66,6 +72,34 @@ object Artwork {
         placeholder(iv)
         if (uri == null) return
         loadSized(iv, uri, viewPx, emptyMap(), "uri:$uri")
+    }
+
+    /**
+     * 按**视图测量宽度**解码 —— 这是封面清晰的唯一可靠做法。
+     *
+     * 真机第一百三十七轮：网格格子实际 205 px，但我们按公式算出的 `cellSizePx` 是 240，
+     * 于是生成的是 240 的位图、画进 205 的格子里（屏幕值 1879 ≈ 240 样张 1898，
+     * 而 205 样张是 2110）—— 公式永远追不上真实布局（RecyclerView padding/margins/装饰都变）。
+     * 现在：请求先挂在这里，等 `addOnLayoutChangeListener` 拿到真实宽度再解码；
+     * 尺寸变了就按新尺寸重来一次。
+     */
+    fun loadAuto(iv: ImageView, uri: Uri, headers: Map<String, String> = emptyMap(),
+                 tag: String = uri.toString()) {
+        placeholder(iv)
+        synchronized(autoReqs) { autoReqs[iv] = AutoReq(uri, headers, tag) }
+        val w = iv.width
+        if (w > 0) { loadSized(iv, uri, w, headers, tag); return }
+        synchronized(autoHooked) {
+            if (autoHooked[iv] == true) return
+            autoHooked[iv] = true
+        }
+        iv.addOnLayoutChangeListener { v, l, t, r, b, ol, ot, or, ob ->
+            val width = r - l
+            if (width <= 0) return@addOnLayoutChangeListener
+            val req = synchronized(autoReqs) { autoReqs[v as ImageView] } ?: return@addOnLayoutChangeListener
+            if (width == or - ol && ol >= 0) return@addOnLayoutChangeListener   // 尺寸没变
+            loadSized(v as ImageView, req.uri, width, req.headers, req.tag)
+        }
     }
 
     fun loadSized(
@@ -106,6 +140,14 @@ object Artwork {
                         iv.post {
                             val still = synchronized(pending) { pending[iv] } == key
                             if (!still) return@post          // 视图已被复用
+                            // ★ 位图边长必须**等于**视图宽度：布局常在 100ms 内二次测量
+                            //   （真机第一百三十七轮：生成 240 画进 205 的格子 = 屏幕值停在 82%）。
+                            //   这里发现尺寸又变了就按新宽度重来一次，保证最终 1:1 绘制。
+                            val w = iv.width
+                            if (w > 0 && w != side) {
+                                loadSized(iv, uri, w, headers, tag)
+                                return@post
+                            }
                             iv.clearColorFilter()
                             iv.setPadding(0, 0, 0, 0)
                             iv.setImageBitmap(scaled)
@@ -136,7 +178,7 @@ object Artwork {
             Log.i(
                 "Artwork",
                 "源 ${src.width}×${src.height} → 面积平均 ${out.width}×${out.height}" +
-                        "（视图 ${iv.width}px，样张 ${f.absolutePath}）"
+                        "（视图 ${iv.width}px id=${Integer.toHexString(iv.id)}，样张 ${f.absolutePath}）"
             )
         } catch (t: Throwable) {
             Log.w("Artwork", "样张落盘失败：${t.message}")

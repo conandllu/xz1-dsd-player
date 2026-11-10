@@ -257,6 +257,7 @@ class PlaybackService : LifecycleService() {
                 stopInternal()
             },
         )
+        startStallWatchdog()
         monitor = UsbDeviceMonitor(this,
             onDevice = { d, conn -> onDacAttached(d, conn) },
             onDetached = { onDacDetached() },
@@ -305,6 +306,11 @@ class PlaybackService : LifecycleService() {
                 } else if (uri != null || path != null) {
                     queue = emptyList(); queueTitles = emptyList(); queueCovers = emptyList(); queueIndex = -1
                     play(uri, path, mode)
+                } else {
+                    // 不带参数就点了播放（STOP 之后、通知栏/媒体键/UI 都可能这样发）：
+                    // 以前这里什么都不做 → 界面停在 PAUSED 不动（第一百三十八轮实测）。
+                    Log.i(TAG, "PLAY（无参数）：生产者已停 → 按当前队列/曲目恢复")
+                    resumeFrom("intent:play")
                 }
             }
             PlayerBus.ACTION_PLAY_URL -> {
@@ -813,7 +819,66 @@ class PlaybackService : LifecycleService() {
      * 真机 96k/24bit 上就是"偶发滋啦"（约 8~10 次/s，且 ring 水位看着还行）。
      * 上限 1.5 s 或 70% 容量，超时就照常起播，不会卡住。
      */
+    /**
+     * 卡死看门狗（真机第一百三十八轮：列表循环重播死锁 55 秒，界面一直是 PLAYING、无任何提示）。
+     *
+     * 判据：`PLAYING` 但已播位置连续 3 s 推进 < 300 ms。
+     * 处置：① 先打 W 日志（ringUsed / xfer 增量 / 反馈是否活着）；
+     *      ② 再尝试 `ensureUnmuted()`（泵若停在"静音不读环"，这一步能救回来）；
+     *      ③ 仍不动就按当前队列重开一次流 —— 宁可断一下，也不能无声卡死。
+     */
+    private var stallPos = -1L
+    private var stallSince = 0L
+    private var stallTries = 0
+
+    private fun startStallWatchdog() {
+        mainHandler.postDelayed(object : Runnable {
+            override fun run() {
+                checkStall()
+                mainHandler.postDelayed(this, 1000)
+            }
+        }, 3000)
+    }
+
+    private fun checkStall() {
+        val playing = PlayerBus.playing && PlayerBus.status == "playing"
+        if (!playing || !producer.isRunning()) {
+            stallPos = -1L; stallSince = 0L; stallTries = 0
+            return
+        }
+        val pos = playPosBytes
+        val now = System.currentTimeMillis()
+        if (stallPos < 0L || pos - stallPos > 300) {      // 正常推进
+            stallPos = pos; stallSince = now; stallTries = 0
+            return
+        }
+        if (now - stallSince < 3000) return
+        val st = runCatching { usb.stats() }.getOrNull()
+        Log.w(TAG, "播放疑似卡住：位置 ${now - stallSince}ms 未推进（pos=$pos " +
+            "ringUsed=${runCatching { usb.ringUsed() }.getOrDefault(-1)} " +
+            "xfer=${st?.getOrNull(0)} underrun=${st?.getOrNull(2)} err=${st?.getOrNull(3)} " +
+            "重置次数=$stallTries）")
+        stallSince = now
+        when (stallTries) {
+            0 -> runCatching { usb.ensureUnmuted() }        // 泵可能停在"静音不读环"
+            1 -> {
+                Log.w(TAG, "卡住自救：重开当前流")
+                runCatching { producer.stop() }
+                resumeFrom("watchdog")
+            }
+            else -> {
+                PlayerBus.errorMessage = "播放卡住（已尝试自动恢复），请重新选择曲目"
+                runCatching { stopInternal() }
+            }
+        }
+        stallTries++
+    }
+
     private fun prefillRingThenUnmute() {
+        // 记下本次预填开始时的 seek 世代：如果预填期间**又有新的 seek 请求**进来
+        // （第一百三十八轮：列表循环重播时两个线程同时 seek），这次淡入就是过期指令，
+        // 必须丢弃，否则会把别人刚做的淡出盖掉，泵停在"只发静音不读环"的中间态。
+        val gen = usb.seekGeneration()
         val cap = 8 * 1024 * 1024                      // 与 native kRingBytes 一致
         // 真机实测（第一百一十七轮）：96k/24bit 目标 0.8 s（600 KB）在首块网络读取 4 s 的场景下
         // 必然超时 → 起播欠载。现在：目标按 0.5 s 音频量算，超时放宽到 6 s；
@@ -838,7 +903,7 @@ class PlaybackService : LifecycleService() {
                     "（${if (last >= target) "已达标" else "超时"}）")
             }
         }
-        usb.ensureUnmuted()
+        usb.ensureUnmuted(gen)
         // 预填期（淡入前）的欠载是"无声段的空洞"，不计入健康度
         runCatching { com.dsd.player.usb.NativeBridge.nativeResetStats() }
     }
