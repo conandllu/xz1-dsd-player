@@ -65,10 +65,21 @@ object Artwork {
         headers: Map<String, String> = emptyMap(),
         tag: String = uri.toString(),
     ) {
-        val side = targetPx(if (viewPx > 0) viewPx else fallbackPx(iv))
+        val display = (if (viewPx > 0) viewPx else fallbackPx(iv)).coerceAtLeast(1)
+        // 解码上界 = 屏宽（源图 600 时就解 600，源图超大时封顶 1024）：
+        // 先把中间图拿够大，再由 BoxScale 按**精确显示尺寸**做面积平均（BOX）缩小。
+        // 以前的 1.5× 只是"够用"，但缩小时走的仍是双线性 —— 真机实测 600→205 只有理想锐度的 51%。
+        val dm = iv.resources.displayMetrics
+        val decodeSide = minOf(maxOf(dm.widthPixels, dm.heightPixels), 1024)
         iv.load(uri) {
-            size(side, side)
+            size(decodeSide, decodeSide)
+            // ★ INEXACT：不要为了"凑到请求尺寸"而把源图**放大**再交给我们。
+            //   实测（600 px 源 → 300 px 显示）：放大到 1080 再面积平均，方差只有 1036；
+            //   直接用 600 做面积平均是 1667（参考上限）。FILL+EXACT 会先 bilinear 放大，白丢细节。
+            precision(coil.size.Precision.INEXACT)
             scale(coil.size.Scale.FILL)          // centerCrop 语义：铺满不变形
+            allowHardware(false)                 // 面积平均要读像素，不能用硬件位图
+            transformations(BoxScale(display))   // ★ 面积平均缩小（BOX），不是双线性
             crossfade(120)
             headers.forEach { (k, v) -> addHeader(k, v) }
             listener(

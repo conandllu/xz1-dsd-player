@@ -440,10 +440,11 @@ static void on_feedback(libusb_transfer* t) {
             long long asked = g_frames_asked.load(std::memory_order_relaxed);
             long long sent = g_frame_bytes > 0
                     ? (long long)(g_bytes.load(std::memory_order_relaxed) / g_frame_bytes) : 0;
-            LOGI("反馈汇总 %.1fs：提交 %lld / 完成 %lld（0字节 %lld，有值 %lld），"
-                 "raw=0x%llx=%lld len=%d 平滑 %.5f 帧/µframe；采用 %lld 帧/秒（%+.1f ppm）｜"
-                 "实发 %.0f 帧（标称 %.0f，%+.1f ppm）｜USB 微帧 %lld（壁钟 %lldms，%+.1f ppm）｜"
-                 "累计 算=%lld 送=%lld 差=%lld｜环 %lldKB",
+            // 分两行打：真机日志里一整行太长容易被截断（第一百三十三轮就只拿到半行）
+            // ★ 判据只有一条："累计 算 − 送" 必须恒为 0 —— 它证明发送节奏完全由
+            //   **微帧累加器**驱动，与壁钟无关（壁钟只用来做诊断对比）。
+            LOGI("反馈汇总A %.1fs：提交 %lld / 完成 %lld（0字节 %lld，有值 %lld）｜"
+                 "raw=0x%llx=%lld len=%d｜平滑 %.5f 帧/µframe｜采用 %lld 帧/秒（%+.1f ppm）",
                  spanMs > 0 ? spanMs / 1000.0 : 30.0,
                  (long long)g_fb_submits.load(std::memory_order_relaxed),
                  (long long)g_fb_dones.load(std::memory_order_relaxed),
@@ -454,10 +455,15 @@ static void on_feedback(libusb_transfer* t) {
                  g_fb_last_len.load(std::memory_order_relaxed),
                  g_fb_smooth > 0.0 ? g_fb_smooth / 8000.0 : 0.0,   // 帧/µframe
                  fb > 0 ? fb : nominal,
-                 nominal > 0 ? ((double)(fb > 0 ? fb : nominal) - (double)nominal) * 1e6 / (double)nominal : 0.0,
-                 actualFrames, nominalFrames, ppm,
-                 pkts, startMs > 0 ? (now - startMs) : 0, ufPpm,
+                 nominal > 0 ? ((double)(fb > 0 ? fb : nominal) - (double)nominal) * 1e6 / (double)nominal : 0.0);
+            LOGI("反馈汇总B：累计 算=%lld 送=%lld 差=%lld（微帧口径，应恒为 0）｜"
+                 "微帧 %lld（壁钟 %lldms，%+.1f ppm，仅诊断）｜每微帧实发 %.6f 帧（目标 %.6f）｜"
+                 "本窗口实发 %.0f 帧（壁钟标称 %.0f，%+.1f ppm，仅诊断）｜环 %lldKB",
                  asked, sent, asked - sent,
+                 pkts, startMs > 0 ? (now - startMs) : 0, ufPpm,
+                 pkts > 0 ? (double)sent / (double)pkts : 0.0,
+                 (double)(fb > 0 ? fb : nominal) / 8000.0,
+                 actualFrames, nominalFrames, ppm,
                  (long long)((head.load(std::memory_order_relaxed) -
                               tail.load(std::memory_order_relaxed)) / 1024));
         }

@@ -182,7 +182,18 @@ adb logcat -s PlaybackService FlacSource FlacFloat HttpFlac StreamByteSource Mp4
 - 换算只做一次：`fps = raw / 65536 × 8000`（UAC2 16.16 样本/微帧），中间不取整；
   日志同时打 `raw` 的十六进制和十进制、平滑后的帧/µframe、以及相对标称的 ppm，便于对账。
 
-## 11c. 封面清晰度（第一百三十二/一百三十三轮）
+## 11d. 面积平均（BOX）才是缩小该用的滤波器（第一百三十四轮，模拟器量化）
+
+- `Bitmap.createScaledBitmap(filter=true)` / `Canvas.drawBitmap` 都是**双线性**：缩小时只采
+  2×2 邻域，600→300（2 倍）就开始丢细节。**面积平均（BOX）**取目标像素对应源矩形内所有像素的均值，
+  缩小不丢能量。同一张 600×600 源图缩到 292 的拉普拉斯方差实测（模拟器截图，含圆角抗锯齿）：
+  双线性 727、单步 BOX（参考上限）1667、**我们的 BoxScale 1525**。
+- **Coil 的 `Scale.FILL` 会先放大再交给你**：请求 1080 而源图只有 600 时，它 bilinear 放大到 1080，
+  再做面积平均就退化成 1036（比直接 BOX 少 38%）。必须加 `precision(Precision.INEXACT)`，
+  让 Coil 只在源分辨率附近**降采样、不放大**，面积平均才吃得到原始像素。
+- 面积平均要读像素 → `allowHardware(false)`；结果尺寸要进 `Transformation.cacheKey`
+  （`box_<size>`），否则不同尺寸会复用同一张缓存。
+
 
 - **解码尺寸必须 ≥ 显示尺寸，而且要显式传给 Coil**。真机实测：网格 205 px 显示却按 ~100 px 解码
   （锐度只有参考值的 7.7%）、播放页 476 px 显示却按 ~360 px 解码（27.6%）。
