@@ -803,21 +803,15 @@ class MainActivity : AppCompatActivity() {
             iv.post { if (iv.width > 0) loadArtwork(iv) }
         }
         if (cover.startsWith("http") || cover.startsWith("file")) {
-            Artwork.placeholder(iv)
             val px = if (viewPx > 0) viewPx
                      else (iv.layoutParams?.height?.takeIf { it > 0 }
                          ?: (160 * resources.displayMetrics.density).toInt())
-            iv.load(cover) {
-                size(Artwork.targetPx(px), Artwork.targetPx(px))
-                scale(coil.size.Scale.FILL)
-                crossfade(120)
-                // WebDAV 的封面图同样需要 Basic 认证（Qobuz/本地为空 map，不影响）
-                PlayerBus.trackCoverHeaders.forEach { (k, v) -> addHeader(k, v) }
-                listener(
-                    onSuccess = { _, _ -> iv.clearColorFilter(); iv.setPadding(0, 0, 0, 0) },
-                    onError = { _, _ -> Artwork.placeholder(iv) },
-                )
-            }
+            // 与本地封面走同一条确定性管线（Coil 只解码，面积平均我们自己缩）
+            // WebDAV 的封面图同样需要 Basic 认证（Qobuz/本地为空 map，不影响）
+            Artwork.loadSized(
+                iv, android.net.Uri.parse(cover), px,
+                PlayerBus.trackCoverHeaders, "track:$cover"
+            )
             return
         }
         Artwork.load(iv, currentAlbumId())

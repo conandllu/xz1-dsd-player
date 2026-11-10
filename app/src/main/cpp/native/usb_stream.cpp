@@ -108,9 +108,19 @@ std::atomic<bool> g_fb_no_device{false};     // 设备已消失：别再重试
 std::atomic<long long> g_packets{0};          // 已提交的等时包数（= 微帧数）
 std::atomic<long long> g_frames_asked{0};     // compute_lengths 算出的帧数（累计）
 std::atomic<long long> g_start_ms{0};         // 开流时刻（CLOCK_MONOTONIC 毫秒）
+// 目标速率用**毫帧/秒**存（1000 倍）：反馈平滑值是 95999.5 这种小数，取整到 96000 会凭空
+// 加 5 ppm（真机第一百三十四轮实测"采用 96000（+0.0 ppm）"就是这么来的）。
+std::atomic<long long> g_fps_x1000{0};        // 0 = 用标称值
+std::atomic<long long> g_submit_fails{0};     // 音频 URB 提交失败次数
+std::atomic<int> g_submit_fail_last{0};       // 最近一次失败的 libusb 错误码
+/** 提交失败的 URB：留在这里由下一次完成回调重新武装（丢掉 1 ms 音频 = 一次可闻的断点） */
+std::atomic<bool> g_xfer_down[kXfers] = {};
 // 反馈值低通：每次完成覆盖 8 微帧 = 1 ms，alpha = 1ms / 500ms
 constexpr double kFbSmoothAlpha = 0.002;
 double g_fb_smooth = 0.0;                     // 仅事件线程读写
+// 每个汇总窗口的算术均值（设备给的是量化值，均值才是真实诉求）
+double g_win_sum_fps = 0.0;
+long long g_win_n = 0;
 
 std::vector<libusb_transfer*> g_xfers;
 std::vector<std::vector<uint8_t>> g_bufs;
@@ -128,16 +138,18 @@ libusb_device_handle* g_handle = nullptr;
  *   若按上一轮的旧长度读数据、却按新长度提交，边界处会带出旧字节 → 嗞嗞声。
  */
 static int compute_lengths(libusb_transfer* x) {
+    // ★ 累加器单位是"毫帧"（1/1000 帧）：目标速率 95999.5 帧/秒 这种小数必须保留，
+    //   取整成 96000 会凭空多送 5 ppm（真机第一百三十四轮就是踩这个：采用 96000 / +0.0 ppm）。
     long long acc = g_acc.load(std::memory_order_relaxed);
     long long framesSum = 0;
-    // 有反馈就用反馈换算出的帧率（已 clamp 到 ±2%），没有就用标称值
-    long long fps = g_fps_eff.load(std::memory_order_relaxed);
-    if (fps <= 0) fps = g_frames_per_sec;
+    // 有反馈就用反馈换算出的速率（已 clamp 到 ±2%），没有就用标称值
+    long long fpsx = g_fps_x1000.load(std::memory_order_relaxed);
+    if (fpsx <= 0) fpsx = (long long)g_frames_per_sec * 1000LL;
     int total = 0;
     for (int i = 0; i < kPktsPerXfer; ++i) {
-        acc += fps;
-        long frames = acc / 8000;
-        acc %= 8000;
+        acc += fpsx;
+        long frames = (long)(acc / 8000000LL);
+        acc %= 8000000LL;
         if (frames < 0) frames = 0;
         long len = frames * g_frame_bytes;
         if (len > g_maxpkt) {
@@ -278,12 +290,25 @@ void pump(libusb_transfer* xfer) {
             LOGI("泵 seek：已丢弃旧缓冲（保持静音，等预填完成后淡入）");
         }
     }
+    // 提交失败 = 这 1 ms 音频直接消失（DAC 侧就是一次断点 → 「嗞」）。
+    // 内联重试 3 次（每次 150 µs，最多 450 µs，远小于 6 个 URB 的缓冲余量）；
+    // 仍失败就记进掉队表，由下一次完成回调重新武装 —— 绝不把这一毫秒丢掉。
     int rc = libusb_submit_transfer(xfer);
+    for (int attempt = 0; rc != LIBUSB_SUCCESS && attempt < 3 && g_running; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::microseconds(150));
+        rc = libusb_submit_transfer(xfer);
+    }
     if (rc != LIBUSB_SUCCESS) {
+        int idx = (int)(long)xfer->user_data;
+        g_submit_fails.fetch_add(1, std::memory_order_relaxed);
+        g_submit_fail_last.store(rc, std::memory_order_relaxed);
         g_errors.fetch_add(1, std::memory_order_relaxed);
-        g_inflight.fetch_sub(1);
+        if (idx >= 0 && idx < kXfers) g_xfer_down[idx].store(true, std::memory_order_relaxed);
+        /* 注意：这里**不**减 inflight —— 它会在 on_done 里被重新武装后重新计入 */
         return;
     }
+    int idx2 = (int)(long)xfer->user_data;
+    if (idx2 >= 0 && idx2 < kXfers) g_xfer_down[idx2].store(false, std::memory_order_relaxed);
     g_submitted.fetch_add(1, std::memory_order_relaxed);
     g_bytes.fetch_add(total, std::memory_order_relaxed);
 }
@@ -301,6 +326,7 @@ static void maybe_retry_feedback() {
     if (n > 30) {
         g_fb_pending.store(false);
         g_fps_eff.store(0);
+        g_fps_x1000.store(0);
         LOGW("反馈端点重试 30 次仍失败：退化为标称帧率（异步反馈不可用）");
         return;
     }
@@ -322,6 +348,22 @@ void on_done(libusb_transfer* xfer) {
         g_errors.fetch_add(1, std::memory_order_relaxed);
     }
     pump(xfer);
+    // 把提交失败的 URB 重新武装（它们不在飞行中，inflight 也没减，只要成功就补回计数）
+    for (int i = 0; i < kXfers; ++i) {
+        if (!g_xfer_down[i].load(std::memory_order_relaxed)) continue;
+        libusb_transfer* t = g_xfers[i];
+        if (!t) continue;
+        int rc = libusb_submit_transfer(t);
+        if (rc == LIBUSB_SUCCESS) {
+            g_xfer_down[i].store(false, std::memory_order_relaxed);
+            g_submitted.fetch_add(1, std::memory_order_relaxed);
+            g_bytes.fetch_add((long long)t->length, std::memory_order_relaxed);
+            static std::atomic<int> rearm_logged{0};
+            if (rearm_logged.fetch_add(1) < 3) LOGI("掉队的音频 URB 已重新武装（slot %d）", i);
+        } else {
+            g_submit_fail_last.store(rc, std::memory_order_relaxed);
+        }
+    }
 }
 
 } // namespace
@@ -343,6 +385,7 @@ static void on_feedback(libusb_transfer* t) {
     static std::atomic<long long> last_bad_log{0};
     static std::atomic<long long> last_sum_ms{0};
     static std::atomic<long long> sum_bytes0{0};
+    static std::atomic<long long> win_pkts0{0};
     static std::atomic<long long> sum_ms0{0};
     auto now_ms = [] {
         return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -385,12 +428,16 @@ static void on_feedback(libusb_transfer* t) {
                 //直接拿单次值当目标会让调速来回横跳。平滑后再取整成整数帧/秒。
                 g_fb_smooth = (g_fb_smooth <= 0.0) ? pick
                                                    : g_fb_smooth + (pick - g_fb_smooth) * kFbSmoothAlpha;
-                long long fps = (long long)(g_fb_smooth + 0.5);
-                long long lo = nominal - nominal / 50;        // -2%
-                long long hi = nominal + nominal / 50;        // +2%
-                if (fps < lo) fps = lo;
-                if (fps > hi) fps = hi;
-                g_fps_eff.store(fps, std::memory_order_relaxed);
+                // 窗口算术均值：设备只给量化过的两档值，均值才是它真正的诉求
+                if (g_win_sum_fps <= 0.0) g_win_sum_fps = pick; else g_win_sum_fps += pick;
+                g_win_n++;
+                double target = g_fb_smooth;
+                double lo = (double)nominal * 0.98, hi = (double)nominal * 1.02;   // ±2%
+                if (target < lo) target = lo;
+                if (target > hi) target = hi;
+                // ★ 毫帧精度存下来（95999.5 不能取整成 96000）
+                g_fps_x1000.store((long long)(target * 1000.0 + 0.5), std::memory_order_relaxed);
+                g_fps_eff.store((long long)(target + 0.5), std::memory_order_relaxed);
                 g_fb_valid.store(true, std::memory_order_relaxed);
                 g_fb_nonzero.fetch_add(1, std::memory_order_relaxed);
             } else {
@@ -444,7 +491,7 @@ static void on_feedback(libusb_transfer* t) {
             // ★ 判据只有一条："累计 算 − 送" 必须恒为 0 —— 它证明发送节奏完全由
             //   **微帧累加器**驱动，与壁钟无关（壁钟只用来做诊断对比）。
             LOGI("反馈汇总A %.1fs：提交 %lld / 完成 %lld（0字节 %lld，有值 %lld）｜"
-                 "raw=0x%llx=%lld len=%d｜平滑 %.5f 帧/µframe｜采用 %lld 帧/秒（%+.1f ppm）",
+                 "raw=0x%llx=%lld len=%d｜平滑 %.5f 帧/µframe｜采用 %.3f 帧/秒（%+.1f ppm）",
                  spanMs > 0 ? spanMs / 1000.0 : 30.0,
                  (long long)g_fb_submits.load(std::memory_order_relaxed),
                  (long long)g_fb_dones.load(std::memory_order_relaxed),
@@ -454,16 +501,33 @@ static void on_feedback(libusb_transfer* t) {
                  (long long)g_fb_last_raw.load(std::memory_order_relaxed),
                  g_fb_last_len.load(std::memory_order_relaxed),
                  g_fb_smooth > 0.0 ? g_fb_smooth / 8000.0 : 0.0,   // 帧/µframe
-                 fb > 0 ? fb : nominal,
-                 nominal > 0 ? ((double)(fb > 0 ? fb : nominal) - (double)nominal) * 1e6 / (double)nominal : 0.0);
-            LOGI("反馈汇总B：累计 算=%lld 送=%lld 差=%lld（微帧口径，应恒为 0）｜"
-                 "微帧 %lld（壁钟 %lldms，%+.1f ppm，仅诊断）｜每微帧实发 %.6f 帧（目标 %.6f）｜"
-                 "本窗口实发 %.0f 帧（壁钟标称 %.0f，%+.1f ppm，仅诊断）｜环 %lldKB",
+                 (double)g_fps_x1000.load(std::memory_order_relaxed) / 1000.0,
+                 nominal > 0 ? ((double)g_fps_x1000.load(std::memory_order_relaxed) / 1000.0
+                                - (double)nominal) * 1e6 / (double)nominal : 0.0);
+            // 窗口内的微帧增量 vs 壁钟时长：常量偏移（例如开流瞬间）不会污染 ppm
+            long long pkts0 = win_pkts0.exchange(pkts, std::memory_order_relaxed);
+            double winPktPpm = 0.0;
+            long long winMs = spanMs;
+            if (winMs > 0) {
+                double expPk = (double)winMs * 8.0;
+                if (expPk > 0.0) winPktPpm = ((double)(pkts - pkts0) - expPk) * 1e6 / expPk;
+            }
+            double winMean = (g_win_n > 0) ? g_win_sum_fps / (double)g_win_n : 0.0;
+            long long winN = g_win_n;
+            g_win_sum_fps = 0.0;
+            g_win_n = 0;
+            LOGI("反馈汇总B：累计 算=%lld 送=%lld 差=%lld（微帧口径，应为 0）｜"
+                 "窗口微帧 %lld（壁钟 %lldms，%+.1f ppm）｜每微帧实发 %.6f 帧（目标 %.6f）｜"
+                 "窗口均值 %.3f 帧/秒（%+.1f ppm，%lld 个样本）｜提交失败 %lld（%s）｜环 %lldKB",
                  asked, sent, asked - sent,
-                 pkts, startMs > 0 ? (now - startMs) : 0, ufPpm,
+                 pkts - pkts0, winMs, winPktPpm,
                  pkts > 0 ? (double)sent / (double)pkts : 0.0,
-                 (double)(fb > 0 ? fb : nominal) / 8000.0,
-                 actualFrames, nominalFrames, ppm,
+                 (double)g_fps_x1000.load(std::memory_order_relaxed) / 8000000.0,
+                 winMean,
+                 nominal > 0 ? (winMean - (double)nominal) * 1e6 / (double)nominal : 0.0,
+                 winN,
+                 (long long)g_submit_fails.load(std::memory_order_relaxed),
+                 libusb_error_name(g_submit_fail_last.load(std::memory_order_relaxed)),
                  (long long)((head.load(std::memory_order_relaxed) -
                               tail.load(std::memory_order_relaxed)) / 1024));
         }
@@ -660,6 +724,10 @@ bool start(int fd, const StreamInfo& info, int rate_hz, int frame_bytes,
     g_inflight.store(0);
     g_packets.store(0);
     g_frames_asked.store(0);
+    g_fps_x1000.store(0);
+    g_submit_fails.store(0);
+    g_submit_fail_last.store(0);
+    for (auto& d : g_xfer_down) d.store(false);
     g_start_ms.store((long long)std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
 
@@ -786,6 +854,7 @@ void stop() {
     }
     g_fb_valid.store(false);
     g_fps_eff.store(0);
+    g_fps_x1000.store(0);
     g_fb_pending.store(false);
     g_ep_fb = 0;
     cleanup();

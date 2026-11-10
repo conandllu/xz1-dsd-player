@@ -633,7 +633,7 @@ class OnlineAdapter(
         if (url.isBlank()) return
         val req = coil.request.ImageRequest.Builder(iv.context)
             .data(url)
-            .size(Artwork.targetPx(sizePx))
+            .size((sizePx * 3 / 2).coerceAtLeast(1))
             .scale(coil.size.Scale.FILL)
             .apply { coverHeaders(url).forEach { (k, v) -> addHeader(k, v) } }
             .target(object : coil.target.Target {

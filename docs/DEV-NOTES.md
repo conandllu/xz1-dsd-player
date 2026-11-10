@@ -182,6 +182,32 @@ adb logcat -s PlaybackService FlacSource FlacFloat HttpFlac StreamByteSource Mp4
 - 换算只做一次：`fps = raw / 65536 × 8000`（UAC2 16.16 样本/微帧），中间不取整；
   日志同时打 `raw` 的十六进制和十进制、平滑后的帧/µframe、以及相对标称的 ppm，便于对账。
 
+## 11e. 别把缩放交给图片库（第一百三十五轮：真机 BOX "未生效"）
+
+- 把 BOX 挂在 Coil 的 `transformations()` 上，在模拟器有效、在真机上"逐位不变"（1879/803）。
+  Coil 的内部顺序 decode → transform → scale，`Scale.FILL` 在"请求尺寸 > 源图"时会先 bilinear
+  **放大**再交给变换 —— 状态不透明，出问题只能猜。
+- 现在改成**确定性自绘管线**：Coil 只负责取图 + 解码（`size(屏宽≤1024)` + `precision(INEXACT)`
+  保证不放大 + `allowHardware(false)`），`Target.onSuccess` 拿位图后后台线程自己做面积平均，
+  主线程 `setImageBitmap`，按 `(uri|边长)` 做 LRU。行为与设备无关，网格/播放页各用各的缓存。
+- **调试图落盘**是排这类问题的捷径：`cacheDir/cover_debug_<边长>.png` + 日志
+  `源 600×600 → 面积平均 300×300`。实测样张方差 1817.8 ≈ 理想 BOX 1813.5（双线性只有 579.7），
+  这才算"证明生效"，而不是看整屏截图猜。
+
+## 11f. 目标速率绝不能取整（第一百三十五轮）
+
+- 反馈平滑值是 `95999.5` 这种小数，取整成 `96000` 会凭空多送 5 ppm（真机日志"采用 96000，
+  +0.0 ppm"就是这么来的，而 DAC 要求 −51 ppm）。
+- 累加器改成**毫帧单位**：`acc += fps_x1000; frames = acc / 8000000; acc %= 8000000;`
+  长期均值严格等于小数目标，且仍是整数 delta-sigma（不会有浮点累积误差）。
+
+## 11g. 音频 URB 提交失败绝不能丢（第一百三十五轮：`累计 算−送 = 576` 的真身）
+
+- `libusb_submit_transfer` 失败时若直接 `return`，那 1 ms 音频就**消失**了 —— 对 DAC 就是一次断点，
+  这正是"累计 算−送"不为 0（576 帧 = 6 个 URB @96k）的来源，也很可能就是偶发「嗞」。
+- 处理：内联重试 3 次（每次 150 µs，最多 450 µs，远小于 6 个 URB 的余量）；仍失败则记进
+  `g_xfer_down[]`，由**下一次完成回调**重新武装并把字节数补回统计。绝不丢弃那一毫秒。
+
 ## 11d. 面积平均（BOX）才是缩小该用的滤波器（第一百三十四轮，模拟器量化）
 
 - `Bitmap.createScaledBitmap(filter=true)` / `Canvas.drawBitmap` 都是**双线性**：缩小时只采
