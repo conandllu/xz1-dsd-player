@@ -46,7 +46,9 @@ class HttpMediaDataSource(
 
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
+            // 读超时 4s：链路有丢包时 TCP 重传通常 1~3s 内恢复，4s 还没数据就是真停顿 ——
+            // 这时中止当前 Range 请求、重试时自动缩小请求范围，避免"一次停顿放大成几十秒碎读"
+            .readTimeout(4, TimeUnit.SECONDS)
             .followRedirects(true)
             .retryOnConnectionFailure(true)
             // CDN（Qobuz 的 akamaized）常解析出 IPv6，而很多网络/模拟器没有可用 IPv6 →
@@ -77,6 +79,9 @@ class HttpMediaDataSource(
 
     /** 正在下载的块（块号 → 门闩）：避免"预读线程和解码线程同时请求同一块"把带宽翻倍 */
     private val inflight = java.util.concurrent.ConcurrentHashMap<Long, java.util.concurrent.CountDownLatch>()
+
+    /** 只在第一次发现"服务器不支持 Range"时告警，避免刷屏 */
+    @Volatile private var noRangeWarned = false
 
     init {
         // 一次 Range 同时拿"总长度 + 首块数据"：以前是 Range:0-0 只探长度、再单独取首块，
@@ -257,12 +262,7 @@ class HttpMediaDataSource(
         val coldStart = cache.isEmpty()
         val span = if (coldStart) minOf(BLOCK / 4L, BLOCK * PREFETCH.toLong()) else BLOCK * PREFETCH.toLong()
         val to = minOf(from + span - 1, totalSize - 1)
-        val req = Request.Builder().url(url)
-            .header("User-Agent", UA)
-            .header("Range", "bytes=$from-$to")
-            .apply { headers.forEach { (k, v) -> header(k, v) } }
-            .build()
-        val body = fetchWithRetry(req, from, to)
+        val body = fetchRange(from, to)
         // body 可能覆盖多块，按块切开缓存
         var off = 0
         var b = startBlock
@@ -285,12 +285,7 @@ class HttpMediaDataSource(
             partialBlocks.remove(startBlock)
             return have
         }
-        val req = Request.Builder().url(url)
-            .header("User-Agent", UA)
-            .header("Range", "bytes=$from-$to")
-            .apply { headers.forEach { (k, v) -> header(k, v) } }
-            .build()
-        val body = fetchWithRetry(req, from, to)
+        val body = fetchRange(from, to)
         val merged = ByteArray(have.size + body.size)
         System.arraycopy(have, 0, merged, 0, have.size)
         System.arraycopy(body, 0, merged, have.size, body.size)
@@ -299,23 +294,77 @@ class HttpMediaDataSource(
         return merged
     }
 
-    /** 429/5xx 之类限流要退避重试，否则 MediaExtractor 的 seek（会连发多个 Range）容易失败 */
-    private fun fetchWithRetry(req: Request, from: Long, to: Long): ByteArray {
+    /**
+     * 取一段数据；429/5xx 与超时都退避重试，并且**每次重试缩小请求范围**。
+     *
+     * 为什么缩小：真机第一百二十三轮遇到"到服务器链路 10% 丢包 + 秒级停顿"，
+     * 一个大 Range 请求被卡住后，重试同一个 2 MB 请求又会再卡一次 —— 越重试越糟。
+     * 缩小范围后总能拿到一部分数据，返回给上层（`fetchBlock` 会把短包当"部分块"处理，
+     * 之后由 `completeBlock` 补齐）。
+     */
+    private fun fetchRange(from: Long, to: Long): ByteArray {
         var last: IOException? = null
+        var hi = to
         for (attempt in 0 until RETRY) {
+            val req = Request.Builder().url(url)
+                .header("User-Agent", UA)
+                .header("Range", "bytes=$from-$hi")
+                .apply { headers.forEach { (k, v) -> header(k, v) } }
+                .build()
             try {
                 ok.newCall(req).execute().use { r ->
-                    if (r.isSuccessful) return r.body?.bytes() ?: throw IOException("空响应")
+                    if (r.isSuccessful) {
+                        val body = r.body ?: throw IOException("空响应")
+                        if (r.code == 200) {
+                            // 服务器忽略 Range（200 + 整文件）：只能流式跳过再读。
+                            // 绝不能 body.bytes() —— 那是把 272 MB 整个读进内存。
+                            if (!noRangeWarned) {
+                                noRangeWarned = true
+                                Log.w(TAG, "服务器不支持 Range（返回 200），已退化为流式跳过读取；" +
+                                    "大文件会很慢，建议换支持 Range 的 WebDAV")
+                            }
+                            val ins = body.byteStream()
+                            var skip = from
+                            val skipBuf = ByteArray(64 * 1024)
+                            while (skip > 0) {
+                                val n = ins.read(skipBuf, 0,
+                                    minOf(skipBuf.size.toLong(), skip).toInt())
+                                if (n <= 0) throw IOException("跳过 $from 字节失败")
+                                skip -= n
+                            }
+                            val want = (to - from + 1).toInt()
+                            val out = ByteArray(want)
+                            var off = 0
+                            while (off < want) {
+                                val n = ins.read(out, off, want - off)
+                                if (n <= 0) break
+                                off += n
+                            }
+                            if (off > 0) return out.copyOf(off)
+                            throw IOException("空响应体")
+                        }
+                        val bytes = body.bytes()
+                        if (bytes.isNotEmpty()) return bytes
+                        throw IOException("空响应体")
+                    }
                     val code = r.code
-                    if (code != 429 && code < 500) throw IOException("HTTP $code（Range $from-$to）")
-                    last = IOException("HTTP $code（Range $from-$to，第 ${attempt + 1} 次）")
+                    if (code != 429 && code < 500) throw IOException("HTTP $code（Range $from-$hi）")
+                    last = IOException("HTTP $code（Range $from-$hi，第 ${attempt + 1} 次）")
                 }
             } catch (e: IOException) {
                 last = e
+                // 缩小一半再试：至少拿到一些数据，剩余的交给后续块/补全逻辑
+                val span = hi - from + 1
+                if (span > 256 * 1024) {
+                    hi = from + span / 2 - 1
+                    Log.w(TAG, "Range 失败（${e.javaClass.simpleName}: ${e.message}），缩小范围重试：$from-$hi")
+                }
             }
-            Thread.sleep(250L * (attempt + 1))
+            try { Thread.sleep(250L * (attempt + 1)) } catch (ie: InterruptedException) {
+                throw IOException("中断", ie)
+            }
         }
-        throw last ?: IOException("Range $from-$to 失败")
+        throw last ?: IOException("Range $from-$hi 失败")
     }
 
     override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {

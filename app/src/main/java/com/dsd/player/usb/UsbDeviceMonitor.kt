@@ -48,12 +48,16 @@ class UsbDeviceMonitor(
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                     val dev: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
                     if (intent.action == UsbManager.ACTION_USB_DEVICE_DETACHED) {
+                        Log.i(TAG, "收到 USB 拔出广播：${dev?.productName ?: dev?.deviceName ?: "?"}")
                         if (dev == null || lastDevice?.deviceName == dev.deviceName) {
                             lastDevice = null
                             onDetached()
                         }
                     } else if (dev != null) {
-                        tryOpen(dev, interactive = false)
+                        Log.i(TAG, "收到 USB 插入广播：${dev.productName ?: dev.deviceName} " +
+                            "(${dev.vendorId.toString(16)}:${dev.productId.toString(16)})，尝试打开")
+                        // interactive=true：热插拔后系统可能要求重新授权，静默放弃会让"插回没反应"无从判断
+                        tryOpen(dev, interactive = true)
                     }
                 }
                 ACTION_USB_PERMISSION -> {
@@ -127,11 +131,15 @@ class UsbDeviceMonitor(
         if (usbManager.hasPermission(dev)) {
             openNow(dev)
         } else if (interactive) {
+            Log.i(TAG, "请求 USB 权限：${dev.vendorId.toString(16)}:${dev.productId.toString(16)}")
             val pi = PendingIntent.getBroadcast(
                 context, 0, Intent(ACTION_USB_PERMISSION).setPackage(context.packageName),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             )
             usbManager.requestPermission(dev, pi)
+        } else {
+            // 以前这里静默返回：热插拔后"没有任何日志"，出问题完全没法判断
+            Log.w(TAG, "插入的设备还没授权（interactive=false），等用户重新插拔或点界面授权")
         }
     }
 

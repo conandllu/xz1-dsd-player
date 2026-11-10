@@ -406,7 +406,8 @@ class PlaybackService : LifecycleService() {
         PlayerBus.usbSummary = usb.usbSummary
         PlayerBus.supportsDsdNative = usb.supportsDsdNative
         notifyUi()
-        // 让出 USB 之后的恢复请求：拿到 DAC 就在原位置继续
+        Log.i(TAG, "DAC 已插回：${usb.label}（${usb.usbSummary}）")
+        // 让出 USB / 拔插之后的恢复请求：拿到 DAC 就在原位置继续
         val resumePos = pendingResumeAt
         if (resumePos >= 0) {
             pendingResumeAt = -1
@@ -446,6 +447,13 @@ class PlaybackService : LifecycleService() {
     }
 
     private fun onDacDetached() {
+        // 记录"拔 DAC 时播到哪"，插回后自动从这里继续（真机第一百二十二轮：以前插回完全没反应）
+        if (PlayerBus.playing || producer.isRunning()) {
+            pendingResumeAt = runCatching { producer.played() }.getOrDefault(playPosBytes)
+            Log.i(TAG, "DAC 已拔出：停在 ${pendingResumeAt / 1024}KB，等插回自动恢复")
+        } else {
+            Log.i(TAG, "DAC 已拔出（当前未播放）")
+        }
         producer.stop()
         usb.detach()
         PlayerBus.connected = false
@@ -806,7 +814,7 @@ class PlaybackService : LifecycleService() {
      * 上限 1.5 s 或 70% 容量，超时就照常起播，不会卡住。
      */
     private fun prefillRingThenUnmute() {
-        val cap = 4 * 1024 * 1024                      // 与 native kRingBytes 一致
+        val cap = 8 * 1024 * 1024                      // 与 native kRingBytes 一致
         // 真机实测（第一百一十七轮）：96k/24bit 目标 0.8 s（600 KB）在首块网络读取 4 s 的场景下
         // 必然超时 → 起播欠载。现在：目标按 0.5 s 音频量算，超时放宽到 6 s；
         // 而且泵改成"启动即静音"，预填期间不会被抽干，这个目标基本都能达到。
@@ -844,10 +852,21 @@ class PlaybackService : LifecycleService() {
 
     private fun restartWithMode(modeName: String?) {
         if (isMainThread()) { postOpen("restartWithMode") { restartWithMode(modeName) }; return }
+        val s = source ?: return
+        // 先算目标配置：PCM 源无论选"自动/DoP/Native"实际都是 PCM@原采样率，
+        // 这种情况下**什么都不用做**——以前照样 stop→reopen→seek→预填，白丢 1.2~6 s。
+        val cur = usb.currentConfig
+        val target = runCatching { usb.decide(s, modeName?.let { parseMode(it) }) }.getOrNull()
+        if (cur != null && target != null && usb.connected &&
+            cur.usbRate == target.usbRate && cur.mode == target.mode) {
+            Log.i(TAG, "切换输出模式：对当前流无影响（${cur.mode} ${cur.usbRate}Hz），保持播放")
+            PlayerBus.outputMode = cur.mode.name
+            notifyUi()
+            return
+        }
         // 用"此刻真实已播字节"而不是上次上报的 playPosBytes：后者最多滞后一个读块，
         // 真机上切模式回退 0.2~1.8 s 就是这么来的。
         val pos = runCatching { producer.played() }.getOrDefault(playPosBytes)
-        val s = source ?: return
         runCatching {
             producer.stop()
             val cfg = usb.openFor(s, modeName?.let { parseMode(it) })

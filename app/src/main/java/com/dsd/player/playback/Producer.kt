@@ -28,8 +28,8 @@ class Producer(
 ) {
     companion object {
         private const val TAG = "Producer"
-        /** 必须与 native 的 kRingBytes 一致（app/src/main/cpp/native/usb_stream.cpp，现 4 MB） */
-        const val RING_CAPACITY = 4 * 1024 * 1024
+        /** 必须与 native 的 kRingBytes 一致（app/src/main/cpp/native/usb_stream.cpp，现 8 MB） */
+        const val RING_CAPACITY = 8 * 1024 * 1024
     }
 
     enum class DsdDataMode { NONE, NATIVE, DOP }
@@ -114,6 +114,32 @@ class Producer(
     }
 
     fun isRunning(): Boolean = running.get()
+
+    /**
+     * 曲末提前淡出：等缓冲降到约 50 ms 就淡出，别等泵把环吃空。
+     *
+     * 泵在静音态不读环形缓冲，所以这里只是"把目标增益降为 0"（10 ms 斜坡），
+     * 剩下的几十毫秒音频会在随后切歌的 seek_flush 里被丢弃 —— 换来的是切歌处
+     * **不再出现 `欠载` 行**（以前每次切歌必有一条）。
+     */
+    private fun fadeOutBeforeEnd() {
+        val c = cfg ?: return
+        val bps = c.usbRate.toLong() * c.frameBytes
+        if (bps <= 0) return
+        val threshold = (bps * 50 / 1000).toInt().coerceAtLeast(2048)
+        val deadline = System.currentTimeMillis() + 3000
+        while (running.get() && System.currentTimeMillis() < deadline) {
+            if (paused) return                       // 用户暂停了：保持静音状态即可
+            if (usb.ringUsed() <= threshold) break
+            try { Thread.sleep(10) } catch (ie: InterruptedException) { return }
+        }
+        if (running.get() && !paused) {
+            runCatching { usb.pauseOutput() }        // nativeSetMute(true) → 10ms 淡出
+            if (com.dsd.player.BuildConfig.DEBUG) {
+                Log.i(TAG, "曲末提前淡出（ring ${usb.ringUsed() / 1024}KB，阈值 ${threshold / 1024}KB）")
+            }
+        }
+    }
 
     /**
      * 等环形缓冲排空（最多等「缓冲时长 × 1.5 + 1s」，约 5.4s @44.1k）。
@@ -264,9 +290,14 @@ class Producer(
                 onProgress(playedBytes(), s.lengthBytes)
                 logSupplyRate()
             }
-            // 读完文件的瞬间环形缓冲里还压着最多 4MB（≈11.9 s @44.1k/16bit）没送出去，
+            // 读完文件的瞬间环形缓冲里还压着最多 8MB（≈23.8 s @44.1k/16bit）没送出去，
             // 直接收尾会把这段音乐整段丢掉——必须等水位归零再结束。
-            if (running.get() && reachedEof) drainRing()
+            // 但在归零**之前**要先主动淡出：真机第一百二十四轮实测，切歌瞬间总有 1 条
+            // `欠载：…环里剩 0 B`——时序是"泵先把环吃空 → 欠载 → 才淡出"，反了。
+            if (running.get() && reachedEof) {
+                fadeOutBeforeEnd()
+                drainRing()
+            }
             if (running.get()) onEnded()
         } catch (ie: InterruptedException) {
             // stop() 打断，正常退出

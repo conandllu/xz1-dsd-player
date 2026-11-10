@@ -41,6 +41,10 @@ struct StreamInfo {
     int clock_port_idx = 0;    // selector 里选中的源索引（1-based）
     FormatCaps caps;
     uint8_t ep_out = 0;    // 等时 OUT 端点地址
+    /** UAC2 异步反馈端点（IN，usage type = feedback）。0 = 无（同步/自适应 DAC） */
+    uint8_t ep_fb = 0;
+    /** bRefresh：反馈值每 2^bRefresh 帧刷新一次（0 = 每帧） */
+    int fb_refresh = 0;
     uint16_t max_packet = 0;   // wMaxPacketSize 的字节数部分
     int iso_mult = 1;      // 每微帧额外事务数：0=1x 1=2x 2=3x
     int subslot = 3;       // 选中 PCM alt 的子槽

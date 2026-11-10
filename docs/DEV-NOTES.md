@@ -151,3 +151,18 @@ adb logcat -s PlaybackService FlacSource FlacFloat HttpFlac StreamByteSource Mp4
   否则会切成 artist=`[Hi` / album=`Res]Test Album`（显示成 `Res]Test Album [Hi`）。
 - 验证小屏不用真机：`adb shell wm size 720x1280 && adb shell wm density 320` 复现 720p 几何，
   用 `uiautomator dump` 读控件 bounds 判断有没有被裁（比肉眼靠谱）。
+
+## 10. USB 异步反馈与曲末淡出（第一百二十五轮）
+
+- **async DAC 必须读 feedback 端点**：XD05 Bal 这类异步 DAC 在流接口上有一个 IN 端点
+  （`bmAttributes` bit5..4 = 01 = feedback，16.16 定点，单位"样本/微帧"）。主机按标称帧率
+  恒定发送时，DAC 晶振与主机标称差几十 ppm，漂到 FIFO 边界就漏/溢一次 —— **主机侧零日志**，
+  听感是偶发「嗞」，且采样率越高越频繁。现在：解析 `ep_fb`/`bRefresh`，开中断 IN 传输周期性读回，
+  按 `fps = fb × 8000 / 65536` 调整每微帧帧数（复用原来的整数 delta-sigma 累加器），
+  并 clamp 在标称 ±2% 内；反馈不可用时自动回落到标称帧率。日志：`feedback=… 帧/µframe（偏差 … ppm）`。
+- **曲末要提前淡出**：等泵把环形缓冲吃空才淡出，切歌处必然出现一条 `欠载：…环里剩 0 B`。
+  现在 EOF 后先等水位降到约 50 ms 再 `set_mute(true)` 淡出，然后才排空/切歌 —— 切歌处不再有欠载行。
+- **HTTP 加固**：读超时 4 s（丢包下 TCP 重传 1–3 s 能容忍，4 s 没数据就是真停顿）；
+  重试时**每次缩小 Range 范围**（大请求卡住后重试同一个大请求只会再卡一次）。
+  服务器不支持 Range（回 200 + 整文件）时必须**流式跳过 + 有界读取**，绝不能 `body.bytes()`。
+- 环形缓冲 8 MB（96k/24bit ≈10.4 s）：链路有 10% 丢包 + 秒级停顿时，4 MB 会被瞬间抽干。

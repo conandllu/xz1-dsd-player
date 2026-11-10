@@ -111,10 +111,13 @@ bool probe(int fd, int device_address, StreamInfo* info, std::string* err) {
                 // alt0 无端点，跳过但仍记录接口号
             }
 
-            // 端点：等时 OUT
+            // 端点：等时 OUT + 异步反馈 IN
             uint8_t ep = 0;
             uint16_t mp = 0;
             int mult = 1;
+            uint8_t ep_fb = 0;
+            int fb_refresh = 0;
+            uint8_t synch_from_out = 0;
             for (uint8_t e = 0; e < alt.bNumEndpoints; ++e) {
                 const libusb_endpoint_descriptor& epd = alt.endpoint[e];
                 bool iso = (epd.bmAttributes & 0x03) == 0x01;
@@ -123,10 +126,20 @@ bool probe(int fd, int device_address, StreamInfo* info, std::string* err) {
                     ep = epd.bEndpointAddress;
                     mp = epd.wMaxPacketSize & 0x07FF;
                     mult = ((epd.wMaxPacketSize >> 11) & 0x03) + 1;
-                    break;
+                    synch_from_out = epd.bSynchAddress;
+                } else if (iso && !outdir) {
+                    // bmAttributes bit5..4 = Usage Type：01 = feedback
+                    int usage = (epd.bmAttributes >> 4) & 0x03;
+                    if (usage == 1 || (synch_from_out != 0 &&
+                                       epd.bEndpointAddress == synch_from_out)) {
+                        ep_fb = epd.bEndpointAddress;
+                        fb_refresh = epd.bRefresh;
+                    }
                 }
             }
             if (ep == 0) continue;
+            // 有的固件只在 OUT 的 bSynchAddress 里写反馈端点地址
+            if (ep_fb == 0 && synch_from_out != 0) ep_fb = synch_from_out;
 
             // 解析 CS AS 描述符（统一走 uac2_parse.h，主机侧有对应的单测）
             uac2parse::AltParsed parsed =
@@ -175,6 +188,8 @@ bool probe(int fd, int device_address, StreamInfo* info, std::string* err) {
                     best_score = score;
                     tgt->as_if = if_num;
                     tgt->ep_out = ep;
+                    tgt->ep_fb = ep_fb;
+                    tgt->fb_refresh = fb_refresh;
                     tgt->max_packet = mp;
                     tgt->iso_mult = mult;
                     tgt->subslot = subslot > 0 ? subslot : 4;
