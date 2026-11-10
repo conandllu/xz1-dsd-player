@@ -197,6 +197,8 @@ adb logcat -s PlaybackService FlacSource FlacFloat HttpFlac StreamByteSource Mp4
   `反馈汇总 30s：提交 N / 完成 M（0字节 Z，有值 L），最近 raw=0x… ，采用 X 帧/秒，
   实发 %f 帧（标称 %f，±ppm），环 …KB`。判据：`有值` 在涨、`采用` 帧/秒偏离标称、
   实发帧数的 ppm 跟着反馈走；三者都不动说明反馈没生效。
+- **interrupt 传输一次只能一个包**：把反馈 URB 改成"多包成串"后，interrupt 回退分支的请求长度
+  也必须回到 `wMaxPacketSize`（写 `8×4=32 B` 会被 usbfs 直接回 `EINVAL`）。iso 分支才是多包。
 - **`NO_DEVICE` 不是"反馈不可用"**：拔线/重开流窗口内提交会回 `LIBUSB_ERROR_NO_DEVICE`，
   这不该消耗重试预算（以前会累计 2 次就放弃）。现在单独标记 `g_fb_no_device`，立刻停试，
   等下次 `open_stream` 重建（每次开流都清零计数器）。
