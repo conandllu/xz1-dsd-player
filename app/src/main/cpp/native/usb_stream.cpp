@@ -83,11 +83,24 @@ bool g_fb_iso = true;
 std::atomic<bool> g_fb_pending{false};
 std::atomic<int> g_fb_attempts{0};
 std::atomic<long long> g_fb_next_try_ms{0};
+/** 一次反馈 URB 里装几个包：UAC2 的 bInterval 是"每 2^(bInterval-1) 微帧一个反馈包"，
+ *  凑成一串提交既对齐设备节奏，也少 8 倍的重提交次数（单包 URB 每微帧重提交一次，
+ *  多数固件在这节奏下根本不回数据 —— 真机第一百二十八轮整段日志一条反馈值都没有）。 */
+constexpr int kFbPackets = 8;
 libusb_transfer* g_fb_xfer = nullptr;
-uint8_t g_fb_buf[4] = {0, 0, 0, 0};
+uint8_t g_fb_buf[kFbPackets * 4] = {0};
 std::atomic<bool> g_fb_valid{false};      // 收到过有效反馈
 std::atomic<long long> g_fps_eff{0};      // 由反馈换算出的"每秒帧数"（0 = 用标称值）
 std::atomic<long long> g_fb_last_log_ms{0};
+// ── 可观测性计数器（真机第一百二十八轮："反馈端点已开，但一条反馈值都没有"）──
+std::atomic<long long> g_fb_submits{0};      // 提交次数
+std::atomic<long long> g_fb_dones{0};        // 完成回调次数
+std::atomic<long long> g_fb_zero{0};         // 完成但 0 字节（设备没给数据）
+std::atomic<long long> g_fb_nonzero{0};      // 完成且拿到数据
+std::atomic<long long> g_fb_last_raw{0};     // 最近一次原始值
+std::atomic<int> g_fb_last_len{0};           // 最近一次实际字节数
+std::atomic<long long> g_fb_nominal_seen{0}; // 最近一次折算出的标称对比（fps）
+std::atomic<bool> g_fb_no_device{false};     // 设备已消失：别再重试
 
 std::vector<libusb_transfer*> g_xfers;
 std::vector<std::vector<uint8_t>> g_bufs;
@@ -264,6 +277,7 @@ void pump(libusb_transfer* xfer) {
 /** 反馈端点重试：由音频 URB 完成回调驱动（每 100ms 最多一次，最多 30 次） */
 static void maybe_retry_feedback() {
     if (!g_fb_pending.load(std::memory_order_relaxed) || !g_running || !g_fb_xfer) return;
+    if (g_fb_no_device.load(std::memory_order_relaxed)) return;   // 设备已消失，等下次开流
     long long now = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
     long long next = g_fb_next_try_ms.load(std::memory_order_relaxed);
@@ -299,36 +313,55 @@ void on_done(libusb_transfer* xfer) {
 } // namespace
 
 /**
- * 反馈端点回调：解码 16.16 定点，换算成"每秒帧数"供 compute_lengths 用。
+ * 反馈端点回调：解码定点值，换算成"每秒帧数"供 compute_lengths 用。
  *
- * UAC2 的 explicit feedback 是这个 DAC 到主机报"每微帧应该送多少样本"，16.16 定点。
- * 但真机上见过两种解释都可能的固件（UAC1 遗留的 10.14 每帧样本），所以两种都算一遍，
- * 取"落在标称 ±10% 内"的那个；都不可信就退标称值，绝不把坏反馈灌进帧长计算。
+ * 真机踩过两种编码，都要认：
+ *   · UAC2 explicit feedback：4 字节，**16.16**，单位"样本/微帧" → fps = raw/65536*8000
+ *   · UAC1 遗留固件：3 字节，**10.14**，单位"样本/帧(1ms)" → fps = raw/16384*1000
+ * 两种都算，取落在标称 ±10% 内的那个；都不在内 → 打 WARN 并退回标称帧率，绝不把坏反馈
+ * 灌进帧长计算。每 30 s 打一条汇总（含原始值 / 提交与完成次数 / 实发帧数 vs 标称 / ppm），
+ * 这样"反馈到底有没有参与调速"一眼可判。
+ *
  * ★ 回调运行在 libusb 事件线程上：这里**绝对不能 sleep**（会让音频 URB 饿死 → 嗞），
  *   重试交给 maybe_retry_feedback()（由音频 URB 完成驱动）。
  */
 static void on_feedback(libusb_transfer* t) {
     static std::atomic<long long> last_bad_log{0};
-    static std::atomic<long long> last_good_log{0};
+    static std::atomic<long long> last_sum_ms{0};
+    static std::atomic<long long> sum_bytes0{0};
+    static std::atomic<long long> sum_ms0{0};
     auto now_ms = [] {
         return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
     };
-    if (t->status != LIBUSB_TRANSFER_COMPLETED) {
-        long long now = now_ms();
-        long long prev = last_bad_log.load(std::memory_order_relaxed);
-        if (now - prev >= 2000 && last_bad_log.compare_exchange_strong(prev, now)) {
-            LOGW("反馈端点状态异常: status=%d actual=%d（%s 模式）",
-                 t->status, t->actual_length, g_fb_iso ? "iso" : "interrupt");
+    g_fb_dones.fetch_add(1, std::memory_order_relaxed);
+
+    // 数据可能在任意一个包里（多包 URB）；libusb 正常会把长度汇总到 actual_length，
+    // 但个别版本只填 iso_packet_desc[].actual_length —— 两个都看。
+    int len = t->actual_length;
+    int pkt = -1;
+    if (len <= 0) {
+        for (int i = 0; i < t->num_iso_packets; ++i) {
+            int l = t->iso_packet_desc[i].actual_length;
+            if (l > 0) { len = l; pkt = i; break; }
         }
-    } else if (t->actual_length >= 4) {
-        uint32_t raw = (uint32_t)g_fb_buf[0] | ((uint32_t)g_fb_buf[1] << 8) |
-                       ((uint32_t)g_fb_buf[2] << 16) | ((uint32_t)g_fb_buf[3] << 24);
+    }
+    if (len > 0) {
+        const uint8_t* d = (pkt >= 0)
+                ? (t->buffer + pkt * (int)t->iso_packet_desc[pkt].length)
+                : t->buffer;
+        // 取 4 字节（3 字节值补 0）
+        uint32_t raw = (uint32_t)d[0];
+        if (len > 1) raw |= (uint32_t)d[1] << 8;
+        if (len > 2) raw |= (uint32_t)d[2] << 16;
+        if (len > 3) raw |= (uint32_t)d[3] << 24;
+        g_fb_last_raw.store((long long)raw, std::memory_order_relaxed);
+        g_fb_last_len.store(len, std::memory_order_relaxed);
         long long nominal = g_frames_per_sec;
         if (nominal > 0) {
             double n = (double)nominal;
             double v_1616 = (double)raw / 65536.0 * 8000.0;   // UAC2：16.16 样本/微帧
-            double v_1014 = (double)raw / 16384.0 * 1000.0;   // 部分固件：10.14 样本/帧
+            double v_1014 = (double)raw / 16384.0 * 1000.0;   // UAC1 遗留：10.14 样本/帧
             bool ok_1616 = v_1616 > n * 0.9 && v_1616 < n * 1.1;
             bool ok_1014 = v_1014 > n * 0.9 && v_1014 < n * 1.1;
             double pick = ok_1616 ? v_1616 : (ok_1014 ? v_1014 : -1.0);
@@ -340,27 +373,57 @@ static void on_feedback(libusb_transfer* t) {
                 if (fps > hi) fps = hi;
                 g_fps_eff.store(fps, std::memory_order_relaxed);
                 g_fb_valid.store(true, std::memory_order_relaxed);
-                long long now = now_ms();
-                long long prev = last_good_log.load(std::memory_order_relaxed);
-                if (now - prev >= 5000 && last_good_log.compare_exchange_strong(prev, now)) {
-                    double ppm = ((double)fps - n) * 1e6 / n;
-                    LOGI("feedback: raw=0x%08x → %.4f 帧/µframe（%s，标称 %.4f，偏差 %+.1f ppm，"
-                         "采用 %lld 帧/秒）",
-                         raw, (double)raw / 65536.0, ok_1616 ? "16.16/微帧" : "10.14/帧",
-                         n / 8000.0, ppm, fps);
-                }
+                g_fb_nonzero.fetch_add(1, std::memory_order_relaxed);
             } else {
+                g_fb_nonzero.fetch_add(1, std::memory_order_relaxed);
                 long long now = now_ms();
                 long long prev = last_bad_log.load(std::memory_order_relaxed);
-                if (now - prev >= 2000 && last_bad_log.compare_exchange_strong(prev, now)) {
-                    LOGW("反馈值不可信: raw=0x%08x（16.16 解释=%.0f 帧/秒，10.14 解释=%.0f 帧/秒，"
+                if (now - prev >= 5000 && last_bad_log.compare_exchange_strong(prev, now)) {
+                    LOGW("反馈值不可信: len=%d raw=0x%08x（16.16 解释=%.0f 帧/秒，10.14 解释=%.0f 帧/秒，"
                          "标称 %lld）→ 仍按标称帧率",
-                         raw, v_1616, v_1014, nominal);
+                         len, raw, v_1616, v_1014, nominal);
                 }
             }
         }
+    } else {
+        g_fb_zero.fetch_add(1, std::memory_order_relaxed);
     }
-    if (g_running && g_fb_xfer) {
+
+    // 每 30 s 一条汇总：这是判断"反馈有没有真的参与调速"的唯一可靠依据
+    {
+        long long now = now_ms();
+        long long prev = last_sum_ms.load(std::memory_order_relaxed);
+        if (now - prev >= 30000 && last_sum_ms.compare_exchange_strong(prev, now)) {
+            long long bytes = g_bytes.load(std::memory_order_relaxed);
+            long long prevBytes = sum_bytes0.exchange(bytes, std::memory_order_relaxed);
+            long long prevMs = sum_ms0.exchange(now, std::memory_order_relaxed);
+            long long spanMs = prevMs > 0 ? (now - prevMs) : 0;
+            long long nominal = g_frames_per_sec;
+            long long fb = g_fps_eff.load(std::memory_order_relaxed);
+            double ppm = 0.0, actualFrames = 0.0, nominalFrames = 0.0;
+            if (spanMs > 0 && g_frame_bytes > 0 && nominal > 0) {
+                actualFrames = (double)(bytes - prevBytes) / (double)g_frame_bytes;
+                nominalFrames = (double)nominal * (double)spanMs / 1000.0;
+                if (nominalFrames > 0.0)
+                    ppm = (actualFrames - nominalFrames) * 1e6 / nominalFrames;
+            }
+            LOGI("反馈汇总 %.0fs：提交 %lld / 完成 %lld（0字节 %lld，有值 %lld），"
+                 "最近 raw=0x%llx (len=%d)；采用 %lld 帧/秒，实发 %.0f 帧（标称 %.0f，%+.1f ppm）；"
+                 "环 %lldKB",
+                 spanMs > 0 ? spanMs / 1000.0 : 30.0,
+                 (long long)g_fb_submits.load(std::memory_order_relaxed),
+                 (long long)g_fb_dones.load(std::memory_order_relaxed),
+                 (long long)g_fb_zero.load(std::memory_order_relaxed),
+                 (long long)g_fb_nonzero.load(std::memory_order_relaxed),
+                 (long long)g_fb_last_raw.load(std::memory_order_relaxed),
+                 g_fb_last_len.load(std::memory_order_relaxed),
+                 fb > 0 ? fb : nominal, actualFrames, nominalFrames, ppm,
+                 (long long)((head.load(std::memory_order_relaxed) -
+                              tail.load(std::memory_order_relaxed)) / 1024));
+        }
+    }
+
+    if (g_running && g_fb_xfer && !g_fb_no_device.load(std::memory_order_relaxed)) {
         if (!submit_feedback_once()) {
             // 不在这里重试（会阻塞事件线程）：交给音频 URB 完成回调按 100ms 节奏重试
             g_fb_pending.store(true, std::memory_order_relaxed);
@@ -382,17 +445,32 @@ static void on_feedback(libusb_transfer* t) {
 static bool submit_feedback_once() {
     if (!g_handle || !g_fb_xfer) return false;
     libusb_transfer* t = g_fb_xfer;
-    int len = g_fb_maxpkt > 0 ? g_fb_maxpkt : 4;
-    if (len > (int)sizeof(g_fb_buf)) len = (int)sizeof(g_fb_buf);
+    int pktLen = g_fb_maxpkt > 0 ? g_fb_maxpkt : 4;
+    if (pktLen > 4) pktLen = 4;                    // UAC2 反馈值最多 4 字节
+    int reqLen = pktLen * kFbPackets;
+    if (reqLen > (int)sizeof(g_fb_buf)) reqLen = (int)sizeof(g_fb_buf);
     if (g_fb_iso) {
-        libusb_fill_iso_transfer(t, g_handle, g_ep_fb, g_fb_buf, len, 1,
+        // ★ 多包：按设备 bInterval 的节奏成串提交。单包 URB（每微帧重提交一次）时，
+        //   真机上设备一个反馈字节都不回（第一百二十八轮整段日志无任何反馈值）。
+        int total = reqLen;
+        int pkts = total / pktLen;
+        libusb_fill_iso_transfer(t, g_handle, g_ep_fb, g_fb_buf, total, pkts,
                                  on_feedback, nullptr, 100);
-        if (t->num_iso_packets > 0) t->iso_packet_desc[0].length = len;
+        for (int i = 0; i < pkts; ++i) t->iso_packet_desc[i].length = pktLen;
     } else {
-        libusb_fill_interrupt_transfer(t, g_handle, g_ep_fb, g_fb_buf, len,
+        libusb_fill_interrupt_transfer(t, g_handle, g_ep_fb, g_fb_buf, reqLen,
                                        on_feedback, nullptr, 0);
     }
+    g_fb_submits.fetch_add(1, std::memory_order_relaxed);
     int rc = libusb_submit_transfer(t);
+    if (rc == LIBUSB_ERROR_NO_DEVICE) {
+        // 设备已消失（拔线 / 重开流窗口）：这不是"反馈不可用"，也不该消耗重试预算
+        g_fb_no_device.store(true, std::memory_order_relaxed);
+        g_fb_pending.store(false, std::memory_order_relaxed);
+        LOGW("反馈端点 0x%02x 提交失败（LIBUSB_ERROR_NO_DEVICE）→ 设备已消失，本次流不再重试反馈",
+             g_ep_fb);
+        return false;
+    }
     if (rc != LIBUSB_SUCCESS) {
         // 重试时同一条会重复几十次：前 3 次 + 之后每 10 次打一条，避免刷屏
         static std::atomic<int> fails{0};
@@ -401,7 +479,7 @@ static bool submit_feedback_once() {
             LOGW("反馈端点 0x%02x 提交失败（%s，%s模式，len=%d attr=0x%02x maxpkt=%d "
                  "interval=%d，累计 %d 次）",
                  g_ep_fb, libusb_error_name(rc), g_fb_iso ? "iso" : "interrupt",
-                 len, g_fb_attr, g_fb_maxpkt, g_fb_interval, n);
+                 reqLen, g_fb_attr, g_fb_maxpkt, g_fb_interval, n);
         }
         return false;
     }
@@ -416,20 +494,31 @@ static void start_feedback(uint8_t ep, int refresh, int attr, int maxpkt, int in
     g_fb_maxpkt = maxpkt > 0 ? maxpkt : 4;
     g_fb_valid.store(false);
     g_fps_eff.store(0);
+    g_fb_no_device.store(false);
+    // 每次开流都清零：上一条流的计数/失败历史不能带过来（否则"累计 2 次"就放弃）
+    g_fb_submits.store(0);
+    g_fb_dones.store(0);
+    g_fb_zero.store(0);
+    g_fb_nonzero.store(0);
+    g_fb_last_raw.store(0);
+    g_fb_last_len.store(0);
+    g_fb_attempts.store(0);
+    g_fb_retry = 0;
     if (ep == 0) return;
     // 描述符里是 isochronous（位 0-1 == 1）就先用 iso；否则先试 interrupt
     g_fb_iso = ((attr & 0x03) == 0x01);
     if (!g_fb_xfer) {
         // ★ 必须按"最长可能用到"的 iso 包数分配：libusb_fill_iso_transfer 不会重新分配
-        //   包描述符数组，用 0 分配再填 1 个 iso 包就是越界写。
-        g_fb_xfer = libusb_alloc_transfer(1);
+        //   包描述符数组，包数不够就是越界写。
+        g_fb_xfer = libusb_alloc_transfer(kFbPackets);
         if (!g_fb_xfer) { LOGW("反馈端点分配失败，按标称帧率发送"); return; }
     }
     if (submit_feedback_once()) {
+        int periodUf = interval > 0 ? (1 << ((interval - 1) & 7)) : 1;
         LOGI("异步反馈端点已开: ep=0x%02x %s attr=0x%02x maxpkt=%d interval=%d bRefresh=%d"
-             "（每 %d 微帧刷新）",
+             "（每 %d 微帧一个反馈包 ≈ %.2f ms，本次 URB %d 包）",
              ep, g_fb_iso ? "iso" : "interrupt", attr, g_fb_maxpkt, interval, refresh,
-             1 << (refresh & 7));
+             periodUf, (double)periodUf / 8.0, kFbPackets);
         return;
     }
     // 首次失败不放弃：有些固件要等音频流真的跑起来（有 URB 在飞）才接受反馈端点。

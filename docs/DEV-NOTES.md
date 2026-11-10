@@ -165,6 +165,9 @@ adb logcat -s PlaybackService FlacSource FlacFloat HttpFlac StreamByteSource Mp4
 - **HTTP 加固**：读超时 4 s（丢包下 TCP 重传 1–3 s 能容忍，4 s 没数据就是真停顿）；
   重试时**每次缩小 Range 范围**（大请求卡住后重试同一个大请求只会再卡一次）。
   服务器不支持 Range（回 200 + 整文件）时必须**流式跳过 + 有界读取**，绝不能 `body.bytes()`。
+- **曲末淡出提前量要 ≥ 200 ms**：50 ms 时真机切歌仍出现 `欠载：URB 需 352 B，只取到 240 B`
+  —— 那正好是泵最后两个 URB 的量，而"判断环低 → 调 native 静音"自身有几十毫秒延迟
+  （日志里环见底到"开始淡出"隔 61 ms），于是泵先饿死。改 200 ms（8 MB 环的 2.5%）+ 5 ms 轮询。
 - 环形缓冲 8 MB（96k/24bit ≈10.4 s）：链路有 10% 丢包 + 秒级停顿时，4 MB 会被瞬间抽干。
 
 ## 11. 反馈端点的提交方式（第一百二十七轮，真机踩到的 EIO 真因）
@@ -181,6 +184,22 @@ adb logcat -s PlaybackService FlacSource FlacFloat HttpFlac StreamByteSource Mp4
 - **反馈值有两种定点解释，要按合理性选**：UAC2 是 16.16「样本/微帧」（`raw/65536*8000` 帧/秒）；
   部分固件沿用 UAC1 的 10.14「样本/帧」（`raw/16384*1000` 帧/秒）。两种都算，取落在标称 ±10% 内
   的那个，都不在内就**退回标称帧率并打 WARN**，绝不把坏反馈灌进帧长计算。
-- **端点身份必须进日志**：`AS altN 端点: data=0x.. fb=0x..(attr/maxpkt/interval/refresh) 数据EP.synchAddr=0x..`。
+- **反馈 URB 要"多包成串"提交，单包 URB 拿不到数据**：UAC2 的 `bInterval` 语义是
+  「每 2^(bInterval-1) 微帧一个反馈包」。按单包 URB 提交等于每微帧重提交一次，
+  真机上设备**一个字节都不回**（第一百二十八轮：端点已开、6 分钟无任何反馈值、也无错误）。
+  现在一次装 `kFbPackets = 8` 个包（`alloc_transfer(8)`，每包 `wMaxPacketSize` 字节），
+  节奏与设备一致，重提交次数也降到 1/8。
+- **反馈值长度要按实际字节数认，不能写死 4**：UAC2 是 4 字节 16.16；UAC1 遗留固件是
+  **3 字节 10.14**（`raw/16384*1000` 帧/秒）。两种解释都算、取落在标称 ±10% 内的那个。
+  另外 `libusb` 个别版本只填 `iso_packet_desc[].actual_length` 而不汇总到 `actual_length`，
+  两个都要看（多包 URB 里数据可能在任何一包）。
+- **必须能看见"反馈到底参没参与调速"**：每 30 s 一条汇总
+  `反馈汇总 30s：提交 N / 完成 M（0字节 Z，有值 L），最近 raw=0x… ，采用 X 帧/秒，
+  实发 %f 帧（标称 %f，±ppm），环 …KB`。判据：`有值` 在涨、`采用` 帧/秒偏离标称、
+  实发帧数的 ppm 跟着反馈走；三者都不动说明反馈没生效。
+- **`NO_DEVICE` 不是"反馈不可用"**：拔线/重开流窗口内提交会回 `LIBUSB_ERROR_NO_DEVICE`，
+  这不该消耗重试预算（以前会累计 2 次就放弃）。现在单独标记 `g_fb_no_device`，立刻停试，
+  等下次 `open_stream` 重建（每次开流都清零计数器）。
+：`AS altN 端点: data=0x.. fb=0x..(attr/maxpkt/interval/refresh) 数据EP.synchAddr=0x..`。
   反馈端点有三种来源（usage=01、数据 EP 的 `bSynchAddress`、无描述符只能猜），没有这行日志时，
   只能看到"反馈 0x81 提交失败"而无法判断是端点选错还是提交方式错。

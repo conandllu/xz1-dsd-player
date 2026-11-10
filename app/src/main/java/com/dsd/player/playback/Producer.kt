@@ -116,22 +116,28 @@ class Producer(
     fun isRunning(): Boolean = running.get()
 
     /**
-     * 曲末提前淡出：等缓冲降到约 50 ms 就淡出，别等泵把环吃空。
+     * 曲末提前淡出：等缓冲降到约 200 ms 就淡出，别等泵把环吃空。
      *
      * 泵在静音态不读环形缓冲，所以这里只是"把目标增益降为 0"（10 ms 斜坡），
-     * 剩下的几十毫秒音频会在随后切歌的 seek_flush 里被丢弃 —— 换来的是切歌处
-     * **不再出现 `欠载` 行**（以前每次切歌必有一条）。
+     * 剩下的几百毫秒音频会在随后切歌的 seek_flush 里被丢弃 —— 换来的是切歌处
+     * **不再出现 `欠载` 行**。
+     *
+     * 为什么从 50 ms 加到 200 ms：真机第一百二十八轮切歌时出现
+     * `欠载：URB 需 352 B，只取到 240 B（差 112 B），环里剩 0 B` ——
+     * 50 ms 的提前量刚好是"泵最后两个 URB 的量"，而这段判断 + 调用 native 静音
+     * 本身就有几十毫秒延迟（日志里从环见底到"开始淡出"隔了 61 ms），于是泵先饿死。
+     * 200 ms（8 MB 环的 2.5%）在听感上仍是"曲尾自然收尾"，但足够盖住这部分延迟。
      */
     private fun fadeOutBeforeEnd() {
         val c = cfg ?: return
         val bps = c.usbRate.toLong() * c.frameBytes
         if (bps <= 0) return
-        val threshold = (bps * 50 / 1000).toInt().coerceAtLeast(2048)
+        val threshold = (bps * 200 / 1000).toInt().coerceAtLeast(8192)
         val deadline = System.currentTimeMillis() + 3000
         while (running.get() && System.currentTimeMillis() < deadline) {
             if (paused) return                       // 用户暂停了：保持静音状态即可
             if (usb.ringUsed() <= threshold) break
-            try { Thread.sleep(10) } catch (ie: InterruptedException) { return }
+            try { Thread.sleep(5) } catch (ie: InterruptedException) { return }
         }
         if (running.get() && !paused) {
             runCatching { usb.pauseOutput() }        // nativeSetMute(true) → 10ms 淡出
