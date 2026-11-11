@@ -908,6 +908,15 @@ bool is_running() { return g_running; }
 
 long long seek_generation() { return g_seek_gen.load(std::memory_order_relaxed); }
 
+/** 泵的增益状态（watchdog 排查用）：低 32 位 = gain*1000，bit32 = silent，bit33 = mute */
+long long pump_state() {
+    long long g = (long long)(g_gain.load(std::memory_order_relaxed) * 1000.0f);
+    if (g_silent.load(std::memory_order_relaxed)) g |= (1LL << 32);
+    if (g_mute.load(std::memory_order_relaxed)) g |= (1LL << 33);
+    if (g_pending_discard.load(std::memory_order_relaxed)) g |= (1LL << 34);
+    return g;
+}
+
 /**
  * seek 后冲刷缓冲：旧位置的数据必须丢掉，否则会先把缓冲里剩下的旧声音播完（≈3 s）。
  * PCM 走"淡出 → 丢弃 → 淡入"，避免丢弃瞬间的波形跳变；DSD/DoP 直接丢。

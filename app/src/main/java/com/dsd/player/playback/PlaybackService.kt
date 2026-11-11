@@ -830,6 +830,7 @@ class PlaybackService : LifecycleService() {
     private var stallPos = -1L
     private var stallSince = 0L
     private var stallTries = 0
+    private var lastWatchRing = -1
 
     private fun startStallWatchdog() {
         mainHandler.postDelayed(object : Runnable {
@@ -843,7 +844,7 @@ class PlaybackService : LifecycleService() {
     private fun checkStall() {
         val playing = PlayerBus.playing && PlayerBus.status == "playing"
         if (!playing || !producer.isRunning()) {
-            stallPos = -1L; stallSince = 0L; stallTries = 0
+            stallPos = -1L; stallSince = 0L; stallTries = 0; lastWatchRing = -1
             return
         }
         val pos = playPosBytes
@@ -854,9 +855,17 @@ class PlaybackService : LifecycleService() {
         }
         if (now - stallSince < 3000) return
         val st = runCatching { usb.stats() }.getOrNull()
-        Log.w(TAG, "播放疑似卡住：位置 ${now - stallSince}ms 未推进（pos=$pos " +
-            "ringUsed=${runCatching { usb.ringUsed() }.getOrDefault(-1)} " +
-            "xfer=${st?.getOrNull(0)} underrun=${st?.getOrNull(2)} err=${st?.getOrNull(3)} " +
+        val ringNow = runCatching { usb.ringUsed() }.getOrDefault(-1)
+        val delta = if (lastWatchRing >= 0) ringNow - lastWatchRing else 0
+        lastWatchRing = ringNow
+        val ps = runCatching { com.dsd.player.usb.NativeBridge.nativePumpState() }.getOrDefault(0L)
+        val gain = (ps and 0xFFFFFFFFL) / 1000.0
+        val silent = (ps shr 32) and 1L == 1L
+        val mute = (ps shr 33) and 1L == 1L
+        val disc = (ps shr 34) and 1L == 1L
+        Log.w(TAG, "播放疑似卡住：位置 ${now - stallSince}ms 未推进（pos=$pos ringUsed=$ringNow " +
+            "Δ环=$delta xfer=${st?.getOrNull(0)} underrun=${st?.getOrNull(2)} " +
+            "err=${st?.getOrNull(3)} gain=$gain silent=$silent mute=$mute 待丢弃=$disc " +
             "重置次数=$stallTries）")
         stallSince = now
         when (stallTries) {

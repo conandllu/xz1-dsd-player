@@ -201,6 +201,17 @@ adb logcat -s PlaybackService FlacSource FlacFloat HttpFlac StreamByteSource Mp4
 - 累加器改成**毫帧单位**：`acc += fps_x1000; frames = acc / 8000000; acc %= 8000000;`
   长期均值严格等于小数目标，且仍是整数 delta-sigma（不会有浮点累积误差）。
 
+## 11k. 曲末淡出的等待预算必须按"环里还能播多久"算（第一百三十九轮：吞掉最后 24 秒）
+
+- 真机现场：解码器读到 EOF 时环里还压着 7155 KB（≈23.7 s @44.1k），而 `fadeOutBeforeEnd()`
+  的等待是**固定 3 s**，超时就无条件 `setMute(true)` → 最后 24 秒整段静音，随后 watchdog
+  判定"位置冻结"并从头重播。用户感受是"每首结尾少 24 秒 + 卡 3 秒 + 回开头"。
+- 现在：`budgetMs = ringUsed/bps*1000 + 2000`，等环真正降到阈值（200 ms）才淡出；
+  超时（泵没在消费）就**跳过淡出**交给 drain，绝不闷掉整段；等待期间每 200 ms 更新一次进度
+  （否则 UI 位置会冻 20 多秒，又会被误判成死锁）。
+- 顺带：seek / 丢弃缓冲后要同步回退遥测基线（`statsPos/statsAt`），否则会出现
+  `送出 -46144KB = -7026KB/s` 这种负数，派生量（剩余时长等）跟着错。
+
 ## 11i. 泵控制必须串行 + 世代号（第一百三十八轮：列表循环重播死锁）
 
 - 真机死锁现场：工作线程与生产者线程在 6 ms 内各调一次 `seekFlush()`+淡入，native 侧交错成

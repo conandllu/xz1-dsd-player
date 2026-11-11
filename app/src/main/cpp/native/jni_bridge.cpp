@@ -151,6 +151,11 @@ Java_com_dsd_player_usb_NativeBridge_nativeSeekGeneration(JNIEnv*, jobject) {
     return (jlong)usbaudio::seek_generation();
 }
 
+JNIEXPORT jlong JNICALL
+Java_com_dsd_player_usb_NativeBridge_nativePumpState(JNIEnv*, jobject) {
+    return (jlong)usbaudio::pump_state();
+}
+
 JNIEXPORT jint JNICALL
 Java_com_dsd_player_usb_NativeBridge_nativeRingWrite(JNIEnv* env, jobject, jbyteArray data,
                                                      jint off, jint len) {

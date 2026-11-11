@@ -37,6 +37,8 @@ void seek_flush();
 bool seek_flush_blocking(int timeout_ms);
 /** seek 世代号（每次 seek 请求 +1），用于丢弃过期淡入 */
 long long seek_generation();
+/** 泵增益状态：低 32 位 gain*1000，bit32 silent / bit33 mute / bit34 pending_discard */
+long long pump_state();
 
 struct Stats {
     long submitted;

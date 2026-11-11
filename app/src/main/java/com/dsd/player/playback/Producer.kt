@@ -57,6 +57,8 @@ class Producer(
     /** 环见底（<256 KB）的窗口计数：直接对应"会不会听到空洞" */
     private var statsRingEmpty = 0
     private var packBuf = ByteArray(128 * 1024)
+    /** 源总字节数（进度用，-1 = 未知） */
+    private var lengthBytes = -1L
 
     fun start(source: AudioSource, config: StreamConfig, byteSource: ByteSource, fromPos: Long) {
         stop()
@@ -73,6 +75,7 @@ class Producer(
             config.mode == OutputMode.DSD_NATIVE -> DsdDataMode.NATIVE
             else -> DsdDataMode.DOP
         }
+        lengthBytes = -1L
         dsdLsbFirst = config.dsdLsbFirst
         subslot = (config.frameBytes / source.info.channels.coerceAtLeast(1)).coerceIn(2, 4)
         running.set(true)
@@ -133,16 +136,40 @@ class Producer(
         val bps = c.usbRate.toLong() * c.frameBytes
         if (bps <= 0) return
         val threshold = (bps * 200 / 1000).toInt().coerceAtLeast(8192)
-        val deadline = System.currentTimeMillis() + 3000
+        val enter = usb.ringUsed()
+        // ★ 预算是"环里还能播多久 + 2 s"，不能是固定 3 s。
+        //   真机第一百三十九轮：解码器读到 EOF 时环里还压着 7155 KB（≈23.7 s @44.1k），
+        //   而这里固定等 3 s 就超时 → 直接 setMute(true)，把最后 24 秒整段静音丢掉，
+        //   用户听到的就是"每首歌结尾少 24 秒 + 卡住 3 秒 + 从头重播"。
+        val budgetMs = if (enter <= threshold) 0L else enter * 1000L / bps + 2000L
+        val deadline = System.currentTimeMillis() + budgetMs
+        var lastProg = 0L
         while (running.get() && System.currentTimeMillis() < deadline) {
             if (paused) return                       // 用户暂停了：保持静音状态即可
+            if (pendingSeek.get() >= 0) return       // 有新的 seek（切歌）：这次淡出作废
             if (usb.ringUsed() <= threshold) break
+            // 这段最长要等"环里还能播多久"（8 MB ≈ 24 s @44.1k），期间不更新进度的话
+            // UI 位置会冻住二十多秒 —— 真机第一百三十九轮就被误判成"死锁"。
+            val nowMs = System.currentTimeMillis()
+            if (nowMs - lastProg >= 200) {
+                lastProg = nowMs
+                onProgress(playedBytes(), lengthBytes)
+            }
             try { Thread.sleep(5) } catch (ie: InterruptedException) { return }
+        }
+        val used = usb.ringUsed()
+        if (used > threshold) {
+            // 泵没在消费环（暂停/被卡住/被别的线程动过）：**不要**闷掉剩余音频，
+            // 交给 drainRing 处理（它有 2 s 无进展逃生），宁可尾部少一点淡出也不能吞掉整段。
+            Log.w(TAG, "曲末淡出跳过：环里仍有 ${used / 1024}KB（预算 ${budgetMs}ms 用完，" +
+                "泵未消费）")
+            return
         }
         if (running.get() && !paused) {
             runCatching { usb.pauseOutput() }        // nativeSetMute(true) → 10ms 淡出
             if (com.dsd.player.BuildConfig.DEBUG) {
-                Log.i(TAG, "曲末提前淡出（ring ${usb.ringUsed() / 1024}KB，阈值 ${threshold / 1024}KB）")
+                Log.i(TAG, "曲末提前淡出（ring ${used / 1024}KB，阈值 ${threshold / 1024}KB，" +
+                    "进入时 ${enter / 1024}KB，等了 ${System.currentTimeMillis() + budgetMs - deadline}ms）")
             }
         }
     }
@@ -242,6 +269,11 @@ class Producer(
                         pos = seekTo
                         reachedEof = false
                         underrunSeen = 0
+                        // 遥测基线一起回退，否则 `pos - statsPos` 会出现巨大负数
+                        // （真机第一百三十九轮：`供数：6s 送出 -46144KB = -7026KB/s`）
+                        statsPos = seekTo
+                        statsAt = System.currentTimeMillis()
+                        statsRingLow = Int.MAX_VALUE
                         // 丢掉环形缓冲里"旧位置"的数据（阻塞到丢弃完成），再显式淡入：
                         // 丢弃后 native 保持静音，必须这里解除，否则会一直静音
                         usb.seekFlush()
@@ -300,6 +332,7 @@ class Producer(
                     // DoP：4 个 DSD 字节 → 8 个 PCM 字节，故 w/2
                     pos += if (dsdDataMode == DsdDataMode.DOP) w / 2 else w
                 }
+                lengthBytes = s.lengthBytes
                 // 进度必须按"已经送给 DAC"的量算：预填进环形缓冲的部分还没播
                 onProgress(playedBytes(), s.lengthBytes)
                 logSupplyRate()
