@@ -201,6 +201,29 @@ adb logcat -s PlaybackService FlacSource FlacFloat HttpFlac StreamByteSource Mp4
 - 累加器改成**毫帧单位**：`acc += fps_x1000; frames = acc / 8000000; acc %= 8000000;`
   长期均值严格等于小数目标，且仍是整数 delta-sigma（不会有浮点累积误差）。
 
+## 11l. 丢弃缓冲后的"保持静音"绝不能盖掉已发出的播放请求（第一百四十二轮：切下一首死锁）
+
+- 现象：曲末淡出（正确）→ 列表循环切下一首 → `ringUsed=8388608 且 Δ环≈0`，泵只发静音不读环；
+  日志里还有 `淡入完成 gain=1.000`，所以不是"gain 没恢复"。
+- 真因：`pump()` 处理 `pending_discard` 时**无条件** `g_silent=true; g_target=0`，把切歌路径刚发来的
+  `set_mute(false)`（target=1）盖掉了 —— 于是泵永远停在静音态，drain/watchdog 都救不回来。
+- 修法：丢弃后按 `g_target` 决定 —— target ≤ 0 才保持静音；target > 0 则 `g_gain=0; g_silent=false`，
+  让 10 ms 斜坡把新数据淡入（既不爆音也不锁死）。`seek_flush` 超时兜底同样处理。
+- 再加一道**状态自愈**：`pump()` 每包开头若发现"已要求播放却仍静音"（target>0 且非暂停），
+  直接解除静音 + 重新淡入并打 W。这样任何未来的状态闷死都能自恢复，不会变成死锁。
+
+## 11m. Android 侧三件必做（第一百四十一/一百四十二轮：黑屏与线程泄漏）
+
+- **单线程执行器必须是进程级单例**：`open-stream` 原来是 Service 的实例字段，Service 被 `idleStop`
+  销毁重建就再建一个线程，旧线程作为 daemon 常驻 —— 存活 13.7 h 的进程里累积 3 个，
+  主线程 resume 被它们占着 USB/锁 → **黑屏 16 s**。现在放 `object Opener` 里，进程内只建一次，
+  并打印创建计数（>1 即泄漏）。
+- **主线程健康度看门狗**（`App.kt`）：Choreographer 帧回调 + 生命周期打点，
+  "onResume → 首帧" 超过 500 ms 打 W、连续 2 s 没帧打 W。黑屏类问题以后在应用日志里可见，
+  不用只靠系统日志倒推。
+- 遥测基线必须随 `start()/seek` 重置：否则换曲后 `pos - statsPos` 会把上一首的累计算进来，
+  打出 `送出 -46144KB = -1786KB/s` 这种负数。
+
 ## 11k. 曲末淡出的等待预算必须按"环里还能播多久"算（第一百三十九轮：吞掉最后 24 秒）
 
 - 真机现场：解码器读到 EOF 时环里还压着 7155 KB（≈23.7 s @44.1k），而 `fadeOutBeforeEnd()`

@@ -76,6 +76,14 @@ class Producer(
             else -> DsdDataMode.DOP
         }
         lengthBytes = -1L
+        // ★ 换曲/重开时必须把遥测基线一起归位：否则 `pos - statsPos` 会算出
+        //   "送出 -46144KB"（= 上一首累计 46 MB，而新曲 pos≈0）——真机第一百四十二轮仍复现。
+        statsPos = fromPos
+        statsAt = 0L
+        statsRingLow = Int.MAX_VALUE
+        statsRingEmpty = 0
+        statsReads = 0
+        statsReadNs = 0
         dsdLsbFirst = config.dsdLsbFirst
         subslot = (config.frameBytes / source.info.channels.coerceAtLeast(1)).coerceIn(2, 4)
         running.set(true)

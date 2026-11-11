@@ -210,15 +210,28 @@ class PlaybackService : LifecycleService() {
      * "取流成功但播放失败"的真实原因（本地文件不联网，所以只有在线播会踩到）。
      * 单线程还能顺带保证开流彼此串行（opening 标志之外的第二道保险）。
      */
-    private val opener = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-        Thread(r, "open-stream").apply { isDaemon = true }
+    // ★ 进程级单例：以前是实例字段，Service 被销毁重建（idleStop 60s 后）就会再建一个
+    //   "open-stream" 线程，旧线程作为 daemon 常驻不退出 —— 真机看到"每播一次 +1 个"，
+    //   存活 13.7 小时的进程里累积 3 个，主线程 resume 被它们占着 USB/锁 → 黑屏 16 s。
+    private object Opener {
+        @Volatile var created = 0
+        val exec: java.util.concurrent.ExecutorService =
+            java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+                created++
+                Thread(r, "open-stream").apply { isDaemon = true }
+            }
     }
+    private val opener: java.util.concurrent.ExecutorService get() = Opener.exec
 
     private fun isMainThread() =
         android.os.Looper.myLooper() == android.os.Looper.getMainLooper()
 
     /** 主线程来的开流请求一律转到 opener；已在工作线程则直接执行 */
     private fun postOpen(tag: String, block: () -> Unit) {
+        // 自检：open-stream 线程数必须恒为 1（>1 就说明有泄漏，黑屏的元凶）
+        // 用创建计数代替 Thread.getAllStackTraces()（后者要遍历所有线程栈，主线程上很贵）
+        val created = Opener.created
+        if (created > 1) Log.w(TAG, "open-stream 线程创建数=$created（应为 1，疑似泄漏）：$tag")
         Log.i(TAG, "开流转到工作线程：$tag")
         opener.execute {
             try {
@@ -395,6 +408,8 @@ class PlaybackService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        // 不 shutdown 单例执行器：Service 可能立刻被重新创建（idleStop 宽限），
+        // 复用同一个线程比反复新建更安全（泄漏就是这么来的）。
         if (instance === this) instance = null
         producer.stop()
         usb.detach()

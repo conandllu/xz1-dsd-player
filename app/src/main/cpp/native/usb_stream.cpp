@@ -211,7 +211,24 @@ void pump(libusb_transfer* xfer) {
     xfer->length = total;
     int got = 0;
     // 已完全静音才跳过读缓冲；淡出期间必须继续取数据，否则波形被硬切 → 爆音
-    const bool silent = g_silent.load(std::memory_order_relaxed);
+    bool silent = g_silent.load(std::memory_order_relaxed);
+    // ★ 状态自愈兜底：已经要求播放（target>0 且非暂停）却还停在静音态，
+    //   说明某次"丢弃后保持静音"把状态闷住了（真机第一百三十八/一百四十二轮的形态）。
+    //   这里直接解开并重新从 0 淡入 —— 宁可多一次淡入，也不能让泵永远不读环。
+    if (silent && !g_mute.load(std::memory_order_relaxed) &&
+        g_target.load(std::memory_order_relaxed) > 0.0f) {
+        static std::atomic<long> last_heal_log{0};
+        long nowMs = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        long prev = last_heal_log.load(std::memory_order_relaxed);
+        if (nowMs - prev >= 2000 && last_heal_log.compare_exchange_strong(prev, nowMs)) {
+            LOGW("泵状态自愈：已要求播放但仍处静音态（环 %dKB）→ 解除静音并淡入",
+                 ring_used() / 1024);
+        }
+        g_gain.store(0.0f, std::memory_order_relaxed);
+        g_silent.store(false, std::memory_order_relaxed);
+        silent = false;
+    }
     if (!silent) {
         long h = tail.load(std::memory_order_relaxed);
         long avail = head.load(std::memory_order_acquire) - h;
@@ -297,12 +314,18 @@ void pump(libusb_transfer* xfer) {
         if (g_silent.load(std::memory_order_relaxed) || g_dsd || g_dop) {
             ring_discard();
             g_pending_discard.store(false);
-            // 丢弃后**一律先保持静音**：此刻环形缓冲是空的，如果这里直接淡入，
-            // 蒸出的 10 ms 全在"无数据"上，等新数据到达时 gain 已经 1.0（等于硬切）。
-            // 由调用方在预填完成后显式 set_mute(false) 触发淡入；
-            // 暂停中（g_mute=true）则等用户恢复，同样从 0 淡入。
-            g_silent.store(true);
-            g_target.store(0.0f);
+            // 丢弃后是否保持静音，取决于**此刻有没有人要求播放**（g_target > 0）。
+            //   ① 没人要求（暂停中/淡出中）→ 保持静音，等调用方 set_mute(false) 淡入；
+            //   ② 已经要求了（切歌后紧接着 resumeOutput 的常见顺序）→ **绝不能**再把它闷回去，
+            //      否则泵会一直"只发静音不读环"：真机第一百四十二轮曲末切下一首就是这么锁死的
+            //      （ring 8 MB 满、Δ环≈0、日志里明明有"淡入完成 gain=1.000"）。
+            if (g_target.load(std::memory_order_relaxed) <= 0.0f) {
+                g_silent.store(true);
+                g_target.store(0.0f);
+            } else {
+                g_gain.store(0.0f);          // 从 0 重新淡入，避免丢弃边界的跳变
+                g_silent.store(false);
+            }
             LOGI("泵 seek：已丢弃旧缓冲（保持静音，等预填完成后淡入）");
         }
     }
@@ -960,10 +983,15 @@ bool seek_flush_blocking(int timeout_ms) {
             // 超时兜底：泵可能已经停了（拔线/停止），直接丢，避免"旧数据永远不丢"
             ring_discard();
             g_pending_discard.store(false);
-            g_silent.store(true);
             g_gain.store(0.0f);
-            g_target.store(0.0f);
-            LOGW("泵 seek：等待淡出超时（%d ms），强制丢弃", timeout_ms);
+            if (g_target.load(std::memory_order_relaxed) <= 0.0f) {
+                g_silent.store(true);
+                g_target.store(0.0f);
+            } else {
+                g_silent.store(false);       // 已要求播放：丢弃后从 0 淡入，不要再闷回去
+            }
+            LOGW("泵 seek：等待淡出超时（%d ms），强制丢弃（target=%.2f）",
+                 timeout_ms, (double)g_target.load(std::memory_order_relaxed));
             return false;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
