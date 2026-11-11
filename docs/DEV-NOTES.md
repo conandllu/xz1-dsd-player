@@ -201,6 +201,21 @@ adb logcat -s PlaybackService FlacSource FlacFloat HttpFlac StreamByteSource Mp4
 - 累加器改成**毫帧单位**：`acc += fps_x1000; frames = acc / 8000000; acc %= 8000000;`
   长期均值严格等于小数目标，且仍是整数 delta-sigma（不会有浮点累积误差）。
 
+## 11o. 运行中被取消的 URB 必须重新武装（第一百四十六轮：全部标志位正确但环不动）
+
+- 症状极其诡异：`silent=false / mute=false / gain=1.0 / 待丢弃=false / 填充来源=环`，
+  但 `ringUsed` 恒定、`Δ环≈0`、`underrun=0 / err=0` —— 所有标志位都说"在播"，环就是不消费。
+- 唯一能同时满足这些观测的机制是：**`on_done` 不再被触发**（URB 被 usbfs 内部取消，
+  例如接口被重新 claim / alt 设置变化），于是 `pump()` 再也不跑；而"提交计数"看着还在涨，
+  是因为重新武装逻辑在补。以前 `on_done` 对 `CANCELLED` 直接 return（那是给停止路径写的），
+  运行中遇到就**静默死掉**，没有任何日志。
+- 修法：运行中（`g_running==true`）收到 `CANCELLED` → 打 W 并**立即重新提交**；
+  失败则记入掉队表交给下一次完成回调重试。
+- 配套诊断（这轮加的，以后这类"静默卡住"一轮定位）：
+  - 每秒一行 `环：rd/wr 可读=…B（…ms 音频）可写=…B 填充=… 本包 total/got fps frame maxpkt acc`；
+  - `W 泵 包长为 0（fps=… frame=… maxpkt=… acc=…）` —— 一条 URB 什么都发不出去时；
+  - `W 泵 读指针 …ms 未前进（可读=… 填充=… total=… got=… gain=…）` —— 要求播放却没消费时。
+
 ## 11n. 输出状态必须是"整体重置"，不能靠若干标志各自增量改（第一百四十四轮）
 
 - 泵的静音/播放由 4 个量共同决定：`g_mute / g_silent / g_target / g_pending_discard`。

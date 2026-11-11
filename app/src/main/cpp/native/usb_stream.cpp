@@ -113,6 +113,7 @@ std::atomic<long long> g_start_ms{0};         // 开流时刻（CLOCK_MONOTONIC 
 std::atomic<long long> g_fps_x1000{0};        // 0 = 用标称值
 std::atomic<long long> g_submit_fails{0};     // 音频 URB 提交失败次数
 std::atomic<long long> g_urbs_done{0};        // 完成的音频 URB 数（×kPktsPerXfer = 微帧）
+long long acc_after = 0;                              // compute_lengths 留下的累加器（诊断用）
 std::atomic<int> g_fill_mode{-1};                     // 填充来源：0=静音 1=环（-1 未定）
 std::atomic<long long> g_fade_start_ms{0};            // 最近一次"要求淡入"的时刻（诊断淡入卡住）
 std::atomic<long long> g_win_frames_min{1LL << 30};   // 本窗口每包最小帧数
@@ -172,6 +173,7 @@ static int compute_lengths(libusb_transfer* x) {
         if (frames > framesMax) framesMax = frames;
     }
     g_acc.store(acc, std::memory_order_relaxed);
+    acc_after = acc;
     g_packets.fetch_add(kPktsPerXfer, std::memory_order_relaxed);
     g_frames_asked.fetch_add(framesSum, std::memory_order_relaxed);
     // 记录本窗口"每包帧数区间"：这才是"帧数有没有真的在抖"的直接证据
@@ -257,6 +259,63 @@ void pump(libusb_transfer* xfer) {
     }
     if (got > 0 && !g_first_data.load(std::memory_order_relaxed)) {
         g_first_data.store(true, std::memory_order_relaxed);
+    }
+    // ── 诊断（真机第一百四十六轮要求）：环指针每秒一行 + 三种"静默卡住"的现场 ──
+    {
+        auto nowMs = [] {
+            return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+        };
+        long long now = nowMs();
+        long long rd = tail.load(std::memory_order_relaxed);
+        long long wr = head.load(std::memory_order_relaxed);
+        long long availNow = wr - rd;
+        static std::atomic<long long> lastRingLog{0};
+        long long prevLog = lastRingLog.load(std::memory_order_relaxed);
+        if (now - prevLog >= 1000 && lastRingLog.compare_exchange_strong(prevLog, now)) {
+            LOGI("环：rd=%lld wr=%lld 可读=%lldB（%lldms 音频）可写=%lldB 填充=%s｜"
+                 "本包 total=%dB got=%dB fps=%.3f 帧/秒 frame=%dB maxpkt=%d acc=%lld",
+                 rd, wr, availNow,
+                 g_bytes_per_sec > 0 ? availNow * 1000 / g_bytes_per_sec : 0,
+                 (long long)kRingBytes - availNow, silent ? "静音" : "环",
+                 total, got,
+                 (double)g_fps_x1000.load(std::memory_order_relaxed) / 1000.0,
+                 g_frame_bytes, g_maxpkt, acc_after);
+        }
+        // ① 包长为 0：一条 URB 什么都发不出去（DAC 收空包、环不消费），但所有标志位都正常
+        if (total <= 0) {
+            static std::atomic<long long> lastZero{0};
+            long long prev = lastZero.load(std::memory_order_relaxed);
+            if (now - prev >= 2000 && lastZero.compare_exchange_strong(prev, now)) {
+                LOGW("泵 包长为 0（fps=%.3f 帧/秒 frame=%dB maxpkt=%d acc=%lld）→ 无法发数据",
+                     (double)g_fps_x1000.load(std::memory_order_relaxed) / 1000.0,
+                     g_frame_bytes, g_maxpkt, acc_after);
+            }
+        }
+        // ② 要求播放、环里有货、但读指针 500ms 不动 → 打现场（最难查的一类静默卡住）
+        static std::atomic<long long> lastRd{0};
+        static std::atomic<long long> lastMove{0};
+        static std::atomic<long long> lastStuckLog{0};
+        long long rdPrev = lastRd.load(std::memory_order_relaxed);
+        if (rd != rdPrev) {
+            lastRd.store(rd, std::memory_order_relaxed);
+            lastMove.store(now, std::memory_order_relaxed);
+        } else if (!silent && g_target.load(std::memory_order_relaxed) > 0.0f &&
+                   availNow > (long long)g_frame_bytes * 2048) {
+            long long mv = lastMove.load(std::memory_order_relaxed);
+            if (mv == 0) { lastMove.store(now, std::memory_order_relaxed); }
+            else if (now - mv > 500) {
+                long long prev = lastStuckLog.load(std::memory_order_relaxed);
+                if (now - prev >= 2000 && lastStuckLog.compare_exchange_strong(prev, now)) {
+                    LOGW("泵 读指针 %lldms 未前进（可读=%lldB 填充=%s total=%dB got=%dB "
+                         "gain=%.2f mute=%d frame=%d maxpkt=%d acc=%lld）",
+                         now - mv, availNow, silent ? "静音" : "环", total, got,
+                         (double)g_gain.load(std::memory_order_relaxed),
+                         (int)g_mute.load(std::memory_order_relaxed),
+                         g_frame_bytes, g_maxpkt, acc_after);
+                }
+            }
+        }
     }
     if (silent) {
         // 全静音态：整段填静音（DoP 保留 marker），不消耗环形缓冲
@@ -416,8 +475,27 @@ static void maybe_retry_feedback() {
 }
 
 void on_done(libusb_transfer* xfer) {
-    if (!g_running || xfer->status == LIBUSB_TRANSFER_CANCELLED ||
-        xfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
+    // 运行中却被"取消"（例如 usbfs 因为 alt 设置变化/接口被重新 claim 而内部取消 URB）：
+    // 这是**静默死掉**的典型形态 —— 所有标志位都显示"正在播放"，但 on_done 从此不再触发、
+    // 泵再也不跑，环一个字节也读不走。这里必须重新武装，不能像停止路径那样直接返回。
+    if (g_running && xfer->status == LIBUSB_TRANSFER_CANCELLED) {
+        static std::atomic<long long> lastCancelLog{0};
+        long long now = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        long long prev = lastCancelLog.load(std::memory_order_relaxed);
+        if (now - prev >= 2000 && lastCancelLog.compare_exchange_strong(prev, now)) {
+            LOGW("音频 URB 运行中被取消（status=CANCELLED）→ 重新提交（否则泵会静默死掉）");
+        }
+        int rc = libusb_submit_transfer(xfer);
+        if (rc != LIBUSB_SUCCESS) {
+            int idx = (int)(long)xfer->user_data;
+            if (idx >= 0 && idx < kXfers) g_xfer_down[idx].store(true, std::memory_order_relaxed);
+            g_submit_fail_last.store(rc, std::memory_order_relaxed);
+            g_inflight.fetch_sub(1);
+        }
+        return;
+    }
+    if (!g_running || xfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
         g_inflight.fetch_sub(1);
         return;
     }
