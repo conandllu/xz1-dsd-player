@@ -29,6 +29,8 @@ void ring_reset();
 /** 丢掉未播放数据（seek 专用；读指针追平写指针） */
 void ring_discard();
 /** seek 后冲刷：淡出 → 丢弃 → 淡入（异步，不等完成） */
+/** 把输出状态整体重置为正在播放（mute=0/discard=0/silent=0，PCM 从 0 淡入） */
+void force_play();
 void seek_flush();
 /**
  * seek 后冲刷的**阻塞**版本：返回时缓冲已丢弃（不含淡入）。

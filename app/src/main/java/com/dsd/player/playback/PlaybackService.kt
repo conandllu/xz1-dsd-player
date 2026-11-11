@@ -884,15 +884,28 @@ class PlaybackService : LifecycleService() {
             "重置次数=$stallTries）")
         stallSince = now
         when (stallTries) {
-            0 -> runCatching { usb.ensureUnmuted() }        // 泵可能停在"静音不读环"
-            1 -> {
-                Log.w(TAG, "卡住自救：重开当前流")
-                runCatching { producer.stop() }
+            // ① 最轻：把输出状态整体重置为"正在播放"（幂等，专治"停在静音填充"）
+            0 -> runCatching {
+                Log.w(TAG, "卡住自救①：重置泵输出状态")
+                usb.forcePlay()
+            }
+            // ② 重开流：连 USB 会话一起重建
+            1 -> runCatching {
+                Log.w(TAG, "卡住自救②：重开当前流")
+                producer.stop()
                 resumeFrom("watchdog")
             }
-            else -> {
-                PlayerBus.errorMessage = "播放卡住（已尝试自动恢复），请重新选择曲目"
-                runCatching { stopInternal() }
+            // ③ 重建 USB 会话（close + open）：不直接"泵停止+清空会话"
+            2 -> runCatching {
+                Log.w(TAG, "卡住自救③：重建 USB 会话")
+                producer.stop()
+                usb.stopStream()
+                resumeFrom("watchdog")
+            }
+            // ④ 放弃：明确告知并停在 PAUSED（不再让状态空掉）
+            else -> runCatching {
+                PlayerBus.errorMessage = "播放卡住（已自动恢复 3 次），请重新选择曲目"
+                stopInternal()
             }
         }
         stallTries++
@@ -927,7 +940,8 @@ class PlaybackService : LifecycleService() {
                     "（${if (last >= target) "已达标" else "超时"}）")
             }
         }
-        usb.ensureUnmuted(gen)
+        // ★ 不是"增量解除静音"，而是把输出状态整体重置为"正在播放"（幂等、与历史无关）
+        usb.forcePlay(gen)
         // 预填期（淡入前）的欠载是"无声段的空洞"，不计入健康度
         runCatching { com.dsd.player.usb.NativeBridge.nativeResetStats() }
     }

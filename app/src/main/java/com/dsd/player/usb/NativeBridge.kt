@@ -55,6 +55,9 @@ object NativeBridge {
     /** seek 世代号：每次 seek 请求 +1，用来丢弃"过期淡入"这类迟到的泵指令 */
     external fun nativeSeekGeneration(): Long
 
+    /** 把泵输出状态整体重置为"正在播放"（切歌预填完成后用，幂等） */
+    external fun nativeForcePlay()
+
     /** 泵增益状态：低 32 位 gain*1000，bit32 silent / bit33 mute / bit34 pending_discard */
     external fun nativePumpState(): Long
     external fun nativeRingFree(): Int

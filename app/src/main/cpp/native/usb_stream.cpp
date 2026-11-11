@@ -113,6 +113,8 @@ std::atomic<long long> g_start_ms{0};         // 开流时刻（CLOCK_MONOTONIC 
 std::atomic<long long> g_fps_x1000{0};        // 0 = 用标称值
 std::atomic<long long> g_submit_fails{0};     // 音频 URB 提交失败次数
 std::atomic<long long> g_urbs_done{0};        // 完成的音频 URB 数（×kPktsPerXfer = 微帧）
+std::atomic<int> g_fill_mode{-1};                     // 填充来源：0=静音 1=环（-1 未定）
+std::atomic<long long> g_fade_start_ms{0};            // 最近一次"要求淡入"的时刻（诊断淡入卡住）
 std::atomic<long long> g_win_frames_min{1LL << 30};   // 本窗口每包最小帧数
 std::atomic<long long> g_win_frames_max{0};           // 本窗口每包最大帧数
 /** seek 世代号：每次 seek 请求 +1。上层"预填完再淡入"这类延迟指令要带世代号回来校验，
@@ -229,6 +231,17 @@ void pump(libusb_transfer* xfer) {
         g_silent.store(false, std::memory_order_relaxed);
         silent = false;
     }
+    // ★ 填充来源状态机（真机第一百四十四轮要求）：只允许两个来源，切换必须打日志。
+    //   以前 `g_silent` 是独立标志，任何一处写错就会永远停在"静音填充"而没人看得出。
+    {
+        int mode = silent ? 0 : 1;
+        int prev = g_fill_mode.exchange(mode, std::memory_order_relaxed);
+        if (prev != mode) {
+            LOGI("泵 填充来源=%s（目标增益 %.2f，环 %dKB）",
+                 mode == 1 ? "环" : "静音",
+                 (double)g_target.load(std::memory_order_relaxed), ring_used() / 1024);
+        }
+    }
     if (!silent) {
         long h = tail.load(std::memory_order_relaxed);
         long avail = head.load(std::memory_order_acquire) - h;
@@ -273,6 +286,24 @@ void pump(libusb_transfer* xfer) {
         fill_silence(xfer->buffer + got, total - got);
     }
 
+    // 淡入超时告警：已经要求播放（target>0）但 gain 500ms 还没动 → 一定是填充来源卡住了
+    if (!silent && !g_dsd && !g_dop) {
+        static std::atomic<long long> last_fade_warn{0};
+        float g0 = g_gain.load(std::memory_order_relaxed);
+        float tg = g_target.load(std::memory_order_relaxed);
+        long long nowMs = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        long long fadeStart = g_fade_start_ms.load(std::memory_order_relaxed);
+        if (g0 < tg && fadeStart > 0 && nowMs - fadeStart > 500) {
+            long long prev = last_fade_warn.load(std::memory_order_relaxed);
+            if (nowMs - prev >= 2000 && last_fade_warn.compare_exchange_strong(prev, nowMs)) {
+                LOGW("淡入未完成：gain=%.3f→%.2f 已 %lldms（填充来源=%s，环 %dKB，mute=%d）",
+                     (double)g0, (double)tg, nowMs - fadeStart,
+                     silent ? "静音" : "环", ring_used() / 1024,
+                     (int)g_mute.load(std::memory_order_relaxed));
+            }
+        }
+    }
     // PCM 增益平滑（10ms 斜坡）：暂停/恢复不再硬切，避免"啪"声
     // DoP / DSD native 的载荷是 DSD 位流，乘 gain 会破坏数据 → 这两条路径仍用静音码硬切
     if (!g_dsd && !g_dop && !silent) {
@@ -311,6 +342,14 @@ void pump(libusb_transfer* xfer) {
     //   这里若无条件淡入，就会出现"暂停后 gain 回到 1.000、声音继续放"并且丢掉缓冲
     //   —— 真机日志里那条 `seek：已丢弃旧缓冲，开始淡入` 夹在暂停中间就是这么来的。
     if (g_pending_discard.load(std::memory_order_relaxed)) {
+        // 已经要求播放（非静音）时也要**立刻清掉这个标志**：如果一直挂着，等下次有人
+        // 进入静音态就会莫名其妙丢掉一整段数据（第一百四十四轮的死锁残留就是这种形态）。
+        if (!silent && !g_dsd && !g_dop &&
+            g_target.load(std::memory_order_relaxed) > 0.0f) {
+            ring_discard();
+            g_pending_discard.store(false, std::memory_order_relaxed);
+            LOGI("泵 丢弃旧缓冲（播放中，已清掉挂起的丢弃请求）");
+        }
         if (g_silent.load(std::memory_order_relaxed) || g_dsd || g_dop) {
             ring_discard();
             g_pending_discard.store(false);
@@ -949,6 +988,33 @@ long long pump_state() {
  *   结果淡出没走完、缓冲没丢 → 列表点歌时旧歌继续放 ≈2.95 s）。
  *   需要等待请用 seek_flush_blocking()。
  */
+/**
+ * 强制恢复播放：把泵输出状态**整体重置**（mute=0、discard=0、silent=0、gain 从 0 淡入）。
+ *
+ * 真机第一百三十八~一百四十四轮反复出现"切歌后泵停在静音填充"：根源是输出状态由
+ * 多个标志（g_mute / g_silent / g_target / g_pending_discard）共同决定，任何一次交错
+ * 都会留下自相矛盾的组合。预填完成后与其"增量地解除静音"，不如把状态一次性写成
+ * "正在播放"这一种合法组合 —— 幂等、与历史无关。
+ */
+void force_play() {
+    if (!g_running) return;
+    g_mute.store(false);
+    g_pending_discard.store(false);
+    if (g_dsd || g_dop) {
+        g_gain.store(1.0f);
+        g_silent.store(false);
+        g_target.store(1.0f);
+    } else {
+        g_gain.store(0.0f);        // 从 0 淡入，避免丢弃边界的跳变
+        g_silent.store(false);
+        g_target.store(1.0f);
+    }
+    g_fade_start_ms.store((long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    LOGI("泵 强制恢复播放（状态重置：mute=0 discard=0 silent=0 gain=%.2f 环=%dKB）",
+         (double)g_gain.load(std::memory_order_relaxed), ring_used() / 1024);
+}
+
 void seek_flush() {
     if (!g_running) { ring_discard(); return; }
     g_pending_discard.store(true);
@@ -1018,6 +1084,8 @@ void set_mute(bool mute) {
         } else {
             g_silent.store(false);         // 允许重新读缓冲
             g_target.store(1.0f);
+            g_fade_start_ms.store((long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
             LOGI("泵 开始淡入（10ms 斜坡，当前 gain=%.3f）",
                  g_gain.load(std::memory_order_relaxed));
         }

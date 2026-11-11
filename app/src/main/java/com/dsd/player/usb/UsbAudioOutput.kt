@@ -255,6 +255,21 @@ class UsbAudioOutput(private val onError: (String) -> Unit) {
         }
     }
 
+    /**
+     * 预填完成 → **整体重置**输出状态为"正在播放"。
+     * 与 ensureUnmuted 的区别：不是"增量解除静音"，而是把 mute/discard/silent/gain
+     * 一次性写成唯一合法组合，历史状态一概丢弃（切歌死锁的根治办法）。
+     */
+    fun forcePlay(seekGen: Long = -1L) {
+        synchronized(pumpLock) {
+            if (seekGen >= 0 && seekGeneration() != seekGen) {
+                Log.w(TAG, "forcePlay：世代已变（$seekGen → ${seekGeneration()}），丢弃过期指令")
+                return
+            }
+            runCatching { NativeBridge.nativeForcePlay() }
+        }
+    }
+
     /** 当前 seek 世代号（每次 seek 请求 +1） */
     fun seekGeneration(): Long = runCatching { NativeBridge.nativeSeekGeneration() }.getOrDefault(0L)
 
