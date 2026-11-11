@@ -308,3 +308,15 @@ the list of platform pitfalls we hit is in [`docs/DEV-NOTES.md`](docs/DEV-NOTES.
 
 **免责声明**：本项目为个人兴趣工程，按"现状"提供，不保证适配所有 DAC / ROM / 音频文件。
 使用前请自行确认你的音源合法，并自行承担设备与数据风险。
+
+### 每次构建后：同步到共享盘（硬流程）
+
+```bash
+# 1) 构建（两个风味）
+JAVA_HOME=$JDK17 ./gradlew assembleDsdDebug assembleCompanionDebug lintDsdDebug --no-daemon
+# 2) 同步 + 回读校验（一条命令搞定：临时名上传 → md5 比对 → 改名 → 重写 APK-INFO → 重挂回读）
+scripts/sync_webdav.sh "<本版一句话说明>"
+```
+
+`scripts/sync_webdav.sh` 会打印 `PASS: 两个 APK 已同步并回读校验一致` 才算完成；
+只要构建产物有变化，**必须**跑这一步，否则测试端取不到新包（目录列表会缓存，同名文件也可能被缓存）。
