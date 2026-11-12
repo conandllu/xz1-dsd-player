@@ -272,7 +272,7 @@ void pump(libusb_transfer* xfer) {
         long long availNow = wr - rd;
         static std::atomic<long long> lastRingLog{0};
         long long prevLog = lastRingLog.load(std::memory_order_relaxed);
-        if (now - prevLog >= 1000 && lastRingLog.compare_exchange_strong(prevLog, now)) {
+        if (now - prevLog >= 5000 && lastRingLog.compare_exchange_strong(prevLog, now)) {
             LOGI("环：rd=%lld wr=%lld 可读=%lldB（%lldms 音频）可写=%lldB 填充=%s｜"
                  "本包 total=%dB got=%dB fps=%.3f 帧/秒 frame=%dB maxpkt=%d acc=%lld",
                  rd, wr, availNow,

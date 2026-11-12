@@ -59,6 +59,8 @@ class Producer(
     private var packBuf = ByteArray(128 * 1024)
     /** 源总字节数（进度用，-1 = 未知） */
     private var lengthBytes = -1L
+    /** 本次流开始时"泵累计送出字节"的基准（位置=当前值−基准） */
+    private var usbSentBase = 0L
 
     fun start(source: AudioSource, config: StreamConfig, byteSource: ByteSource, fromPos: Long) {
         stop()
@@ -76,6 +78,8 @@ class Producer(
             else -> DsdDataMode.DOP
         }
         lengthBytes = -1L
+        // 位置记账的新基准：泵"累计送出字节"从此刻开始算（换流时 native 计数会归零）
+        usbSentBase = runCatching { usb.stats()[1] }.getOrDefault(0L)
         // ★ 换曲/重开时必须把遥测基线一起归位：否则 `pos - statsPos` 会算出
         //   "送出 -46144KB"（= 上一首累计 46 MB，而新曲 pos≈0）——真机第一百四十二轮仍复现。
         statsPos = fromPos
@@ -114,14 +118,21 @@ class Producer(
     /** 此刻"真正已送出"的字节数（读块可能领先，但 ring 里未播的部分会被扣掉）——切模式/恢复用 */
     fun played(): Long = playedBytes()
 
-    /** 已播放字节 = 已读出字节 − 环形缓冲里尚未送出的字节（含 DoP 的 4:1 换算） */
+    /**
+     * 已播放字节 = **泵实际交给 USB 的字节数（单调递增）**。
+     *
+     * 以前是 `pos - ringUsed()`：环满时 producer 写多少、泵就读多少，两者同步增长，
+     * 差值会**长期停住**，于是 UI 位置冻结、watchdog 判定"卡住"并把好流杀掉
+     * （真机第一百四十七轮：环指针日志证明 `rd` 每秒 +352,440 B 在正常播放，`pos` 却停在 1.6 MB）。
+     * 换成泵侧计数后：只要音频在往 DAC 送，位置就一定前进；与环形缓冲水位无关。
+     */
     private fun playedBytes(): Long {
-        val used = usb.ringUsed().toLong()
-        val pending = when (dsdDataMode) {
-            DsdDataMode.DOP -> used / 2      // DoP：1 个 DSD 字节 = 2 个 PCM 字节
-            else -> used
+        val sent = runCatching { usb.stats()[1] - usbSentBase }.getOrDefault(0L)
+        val srcBytes = when (dsdDataMode) {
+            DsdDataMode.DOP -> sent / 2      // DoP：1 个 DSD 字节 = 2 个 PCM 字节
+            else -> sent
         }
-        return (pos - pending).coerceAtLeast(0)
+        return srcBytes.coerceIn(0L, pos)
     }
 
     fun isRunning(): Boolean = running.get()

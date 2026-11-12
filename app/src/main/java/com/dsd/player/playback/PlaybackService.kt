@@ -846,6 +846,7 @@ class PlaybackService : LifecycleService() {
     private var stallSince = 0L
     private var stallTries = 0
     private var lastWatchRing = -1
+    private var lastWatchSent = 0L
 
     private fun startStallWatchdog() {
         mainHandler.postDelayed(object : Runnable {
@@ -860,6 +861,7 @@ class PlaybackService : LifecycleService() {
         val playing = PlayerBus.playing && PlayerBus.status == "playing"
         if (!playing || !producer.isRunning()) {
             stallPos = -1L; stallSince = 0L; stallTries = 0; lastWatchRing = -1
+            lastWatchSent = 0L
             return
         }
         val pos = playPosBytes
@@ -868,8 +870,21 @@ class PlaybackService : LifecycleService() {
             stallPos = pos; stallSince = now; stallTries = 0
             return
         }
-        if (now - stallSince < 3000) return
+        if (now - stallSince < 5000) return
         val st = runCatching { usb.stats() }.getOrNull()
+        // ★ 先判断"音频到底有没有在流动"：泵累计送出字节在涨 = 音频在播，
+        //   此时 position 不动只可能是**记账问题**，绝不能自救（真机第一百四十七轮：
+        //   环每秒 +352,440 B 在正常播放，只因为 pos 停住就被连开三级自救把好流杀了）。
+        val sentNow = st?.getOrNull(1) ?: 0L
+        val elapsed = now - stallSince
+        val expect = if (usbBytesPerSec > 0) usbBytesPerSec * elapsed / 1000 else 0L
+        val sentDelta = sentNow - lastWatchSent
+        lastWatchSent = sentNow
+        if (expect > 0 && sentDelta * 2 >= expect) {
+            Log.w(TAG, "位置记账异常（泵在送数据 $sentDelta B / ${elapsed}ms，pos 未动）→ 不判定卡死")
+            stallSince = now
+            return
+        }
         val ringNow = runCatching { usb.ringUsed() }.getOrDefault(-1)
         val delta = if (lastWatchRing >= 0) ringNow - lastWatchRing else 0
         lastWatchRing = ringNow
