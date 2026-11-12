@@ -208,6 +208,9 @@ adb logcat -s PlaybackService FlacSource FlacFloat HttpFlac StreamByteSource Mp4
 - 现在：`played = 泵累计送出字节 − 本次流开始时的基准`（DoP 再 ÷2），单调递增、与环形水位无关。
 - **`Δ环` 不能用来判断"泵有没有在消费"**：环满时每读走 352 B 就立刻补 352 B，`Δ环` 天然恒≈0。
   正确判据是 `rd` 是否前进 / `got == total` / 泵累计送出字节是否在涨。
+- 位置要带**基准**：`played = posBase + (泵送出字节 − usbSentBase)`，`start()` 与 **seek 成功时**都要重记基准；
+  早期版本用 `coerceIn(0, pos)` 会在 EOF 后把位置钉死在文件长度上 → watchdog 每 5 秒误报
+  `位置记账异常`（真机第一百四十九轮 2 分钟 23 条）。现在改成单调不回退（`lastPlayed`），并给告警降频（首现 + 每 60 s）。
 - watchdog 加前置判断：位置不动但"泵送出字节"仍以 ≥50% 预期速率增长 → 只打
   `W 位置记账异常（泵在送数据 …，pos 未动）`，**绝不自救**（以前会把好流连开三级自救杀掉）；
   自救间隔也从 3 s 放宽到 5 s。
@@ -250,6 +253,14 @@ adb logcat -s PlaybackService FlacSource FlacFloat HttpFlac StreamByteSource Mp4
   让 10 ms 斜坡把新数据淡入（既不爆音也不锁死）。`seek_flush` 超时兜底同样处理。
 - 再加一道**状态自愈**：`pump()` 每包开头若发现"已要求播放却仍静音"（target>0 且非暂停），
   直接解除静音 + 重新淡入并打 W。这样任何未来的状态闷死都能自恢复，不会变成死锁。
+
+## 11q. 自己管一个工作线程，比 Executors 更可控（第一百四十九轮：启动后出现 2 个 open-stream）
+
+- 即使换成 `newSingleThreadExecutor` 的进程级单例，真机上仍观察到 2 个同名线程（一个空转）。
+  最终改成**自管理**：`LinkedBlockingQueue<Pair<tag, ()->Unit>>` + 一个死循环线程，
+  `synchronized` 里只允许建一次，任务异常就地捕获（不影响后续任务）。
+- 验证方法：反复触发 `play`（`am start-foreground-service -a com.dsd.player.PLAY --es path …`）
+  后 `ps -T -p <pid> | grep -c open-stream` 必须恒为 1；进程重启后未播放时应为 0（懒创建）。
 
 ## 11m. Android 侧三件必做（第一百四十一/一百四十二轮：黑屏与线程泄漏）
 

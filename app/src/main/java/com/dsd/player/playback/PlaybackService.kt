@@ -213,36 +213,49 @@ class PlaybackService : LifecycleService() {
     // ★ 进程级单例：以前是实例字段，Service 被销毁重建（idleStop 60s 后）就会再建一个
     //   "open-stream" 线程，旧线程作为 daemon 常驻不退出 —— 真机看到"每播一次 +1 个"，
     //   存活 13.7 小时的进程里累积 3 个，主线程 resume 被它们占着 USB/锁 → 黑屏 16 s。
+    /**
+     * 开流工作线程：**进程内唯一**。
+     *
+     * 用自己的队列 + 一个死循环线程，而不是 Executors：真机第一百四十九轮看到启动后
+     * 进程里有 2 个 `open-stream`（其中一个空转 0.16 s），说明执行器的线程还会被重建/多建。
+     * 自己管就只有一个：线程建好后永不退出，任务异常就地吞掉（不影响后续任务）。
+     */
     private object Opener {
+        private val queue = java.util.concurrent.LinkedBlockingQueue<Pair<String, () -> Unit>>()
+        @Volatile private var started = false
         @Volatile var created = 0
-        val exec: java.util.concurrent.ExecutorService =
-            java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-                created++
-                Thread(r, "open-stream").apply { isDaemon = true }
+
+        fun submit(tag: String, fn: () -> Unit) {
+            synchronized(this) {
+                if (!started) {
+                    started = true
+                    created++
+                    Thread({
+                        Log.i(TAG, "open-stream 工作线程启动（进程内唯一）")
+                        while (true) {
+                            val job = try { queue.take() } catch (ie: InterruptedException) { continue }
+                            try {
+                                job.second()
+                            } catch (t: Throwable) {
+                                Log.e(TAG, "开流失败（${job.first}）", t)
+                                PlayerBus.errorMessage = t.message ?: "播放失败"
+                                PlayerBus.status = "error"
+                            }
+                        }
+                    }, "open-stream").apply { isDaemon = true; start() }
+                }
             }
+            queue.put(tag to fn)
+        }
     }
-    private val opener: java.util.concurrent.ExecutorService get() = Opener.exec
 
     private fun isMainThread() =
         android.os.Looper.myLooper() == android.os.Looper.getMainLooper()
 
     /** 主线程来的开流请求一律转到 opener；已在工作线程则直接执行 */
     private fun postOpen(tag: String, block: () -> Unit) {
-        // 自检：open-stream 线程数必须恒为 1（>1 就说明有泄漏，黑屏的元凶）
-        // 用创建计数代替 Thread.getAllStackTraces()（后者要遍历所有线程栈，主线程上很贵）
-        val created = Opener.created
-        if (created > 1) Log.w(TAG, "open-stream 线程创建数=$created（应为 1，疑似泄漏）：$tag")
         Log.i(TAG, "开流转到工作线程：$tag")
-        opener.execute {
-            try {
-                block()
-            } catch (e: Throwable) {
-                Log.e(TAG, "开流失败（$tag）", e)
-                PlayerBus.errorMessage = e.message ?: "播放失败"
-                PlayerBus.status = "error"
-                notifyUi()
-            }
-        }
+        Opener.submit(tag) { block() }
     }
 
     override fun onCreate() {
@@ -847,6 +860,7 @@ class PlaybackService : LifecycleService() {
     private var stallTries = 0
     private var lastWatchRing = -1
     private var lastWatchSent = 0L
+    private var lastAccountingWarn = 0L
 
     private fun startStallWatchdog() {
         mainHandler.postDelayed(object : Runnable {
@@ -881,7 +895,12 @@ class PlaybackService : LifecycleService() {
         val sentDelta = sentNow - lastWatchSent
         lastWatchSent = sentNow
         if (expect > 0 && sentDelta * 2 >= expect) {
-            Log.w(TAG, "位置记账异常（泵在送数据 $sentDelta B / ${elapsed}ms，pos 未动）→ 不判定卡死")
+            // 降频：首现一次 + 之后每 60 秒一次（真机 149 发现每 5 秒一条会把环指针日志淹掉）
+            val last = lastAccountingWarn
+            if (last == 0L || now - last >= 60_000) {
+                lastAccountingWarn = now
+                Log.w(TAG, "位置记账异常（泵在送数据 $sentDelta B / ${elapsed}ms，pos 未动）→ 不判定卡死")
+            }
             stallSince = now
             return
         }

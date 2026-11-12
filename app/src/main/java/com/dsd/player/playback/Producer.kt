@@ -59,8 +59,12 @@ class Producer(
     private var packBuf = ByteArray(128 * 1024)
     /** 源总字节数（进度用，-1 = 未知） */
     private var lengthBytes = -1L
-    /** 本次流开始时"泵累计送出字节"的基准（位置=当前值−基准） */
+    /** 本次流开始时"泵累计送出字节"的基准（位置 = posBase + 当前值 − 基准） */
     private var usbSentBase = 0L
+    /** 本次流起点（seek 后会变成 seek 目标） */
+    private var posBase = 0L
+    /** 对外位置（单调不回退） */
+    private var lastPlayed = 0L
 
     fun start(source: AudioSource, config: StreamConfig, byteSource: ByteSource, fromPos: Long) {
         stop()
@@ -80,6 +84,8 @@ class Producer(
         lengthBytes = -1L
         // 位置记账的新基准：泵"累计送出字节"从此刻开始算（换流时 native 计数会归零）
         usbSentBase = runCatching { usb.stats()[1] }.getOrDefault(0L)
+        posBase = fromPos
+        lastPlayed = fromPos
         // ★ 换曲/重开时必须把遥测基线一起归位：否则 `pos - statsPos` 会算出
         //   "送出 -46144KB"（= 上一首累计 46 MB，而新曲 pos≈0）——真机第一百四十二轮仍复现。
         statsPos = fromPos
@@ -127,12 +133,17 @@ class Producer(
      * 换成泵侧计数后：只要音频在往 DAC 送，位置就一定前进；与环形缓冲水位无关。
      */
     private fun playedBytes(): Long {
+        // 基准 + 本次流"泵送出字节"的增量（单调递增，不依赖 ringUsed，也不受 EOF 后 pos 停住影响）
         val sent = runCatching { usb.stats()[1] - usbSentBase }.getOrDefault(0L)
-        val srcBytes = when (dsdDataMode) {
+        val delta = when (dsdDataMode) {
             DsdDataMode.DOP -> sent / 2      // DoP：1 个 DSD 字节 = 2 个 PCM 字节
             else -> sent
         }
-        return srcBytes.coerceIn(0L, pos)
+        val now = posBase + delta
+        // 单调保护：绝不让对外位置回退（以前 `coerceIn(0, pos)` 会在 EOF 后把位置钉死，
+        // 于是 watchdog 一直以为"pos 未动"，每 5 秒刷一条误报 —— 真机第一百四十九轮）
+        if (now > lastPlayed) lastPlayed = now
+        return lastPlayed
     }
 
     fun isRunning(): Boolean = running.get()
@@ -293,6 +304,10 @@ class Producer(
                         statsPos = seekTo
                         statsAt = System.currentTimeMillis()
                         statsRingLow = Int.MAX_VALUE
+                        // 位置基准也跟着 seek 走（否则位置会从旧基准继续累加）
+                        runCatching { usb.stats()[1] }.onSuccess {
+                            usbSentBase = it; posBase = seekTo; lastPlayed = seekTo
+                        }
                         // 丢掉环形缓冲里"旧位置"的数据（阻塞到丢弃完成），再显式淡入：
                         // 丢弃后 native 保持静音，必须这里解除，否则会一直静音
                         usb.seekFlush()
