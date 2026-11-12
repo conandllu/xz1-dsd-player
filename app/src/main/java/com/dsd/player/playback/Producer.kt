@@ -148,6 +148,10 @@ class Producer(
 
     fun isRunning(): Boolean = running.get()
 
+    /** 是否处于"解码已到底、正在把环里剩的音频播完"的阶段（此时位置前进得很慢是正常的） */
+    @Volatile private var draining = false
+    fun isDraining(): Boolean = draining
+
     /**
      * 曲末提前淡出：等缓冲降到约 200 ms 就淡出，别等泵把环吃空。
      *
@@ -217,6 +221,7 @@ class Producer(
         var lastUsed = usb.ringUsed()
         val enter = lastUsed
         var lastLog = 0L
+        var lastProg = 0L
         var stalledSince = 0L
         while (running.get() && System.currentTimeMillis() - t0 < budgetMs) {
             val used = usb.ringUsed()
@@ -224,6 +229,12 @@ class Producer(
             val now = System.currentTimeMillis()
             if (used != lastUsed) { lastUsed = used; stalledSince = 0 }
             else if (stalledSince == 0L) stalledSince = now
+            // 排空（曲末）阶段泵仍在送数据：必须同步更新对外位置，否则会冻在曲末值上，
+            // watchdog 就会周期性报"泵在送数据但 pos 未动"（真机第一百五十一轮，每 60 秒一条）。
+            if (now - lastProg >= 200) {
+                lastProg = now
+                onProgress(playedBytes(), lengthBytes)
+            }
             // 每 500ms 打一次水位，便于判断"泵是否真的在消费"
             if (now - lastLog > 500) {
                 lastLog = now
@@ -376,8 +387,10 @@ class Producer(
             // 但在归零**之前**要先主动淡出：真机第一百二十四轮实测，切歌瞬间总有 1 条
             // `欠载：…环里剩 0 B`——时序是"泵先把环吃空 → 欠载 → 才淡出"，反了。
             if (running.get() && reachedEof) {
+                draining = true
                 fadeOutBeforeEnd()
                 drainRing()
+                draining = false
             }
             if (running.get()) onEnded()
         } catch (ie: InterruptedException) {

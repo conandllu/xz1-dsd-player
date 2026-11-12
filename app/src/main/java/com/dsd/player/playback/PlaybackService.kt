@@ -284,6 +284,12 @@ class PlaybackService : LifecycleService() {
             },
         )
         startStallWatchdog()
+        // 一次性线程普查：确认进程内 open-stream 只有 1 个（真机第一百五十一轮仍看到 2 个）
+        runCatching {
+            val names = Thread.getAllStackTraces().keys.map { it.name }
+            val n = names.count { it.startsWith("open-stream") }
+            Log.i(TAG, "线程普查：open-stream=$n（预期 0 或 1）｜总线程=${names.size}")
+        }
         monitor = UsbDeviceMonitor(this,
             onDevice = { d, conn -> onDacAttached(d, conn) },
             onDetached = { onDacDetached() },
@@ -873,7 +879,8 @@ class PlaybackService : LifecycleService() {
 
     private fun checkStall() {
         val playing = PlayerBus.playing && PlayerBus.status == "playing"
-        if (!playing || !producer.isRunning()) {
+        // 曲末排空阶段位置本来就几乎不动，不参与卡死判定
+        if (!playing || !producer.isRunning() || producer.isDraining()) {
             stallPos = -1L; stallSince = 0L; stallTries = 0; lastWatchRing = -1
             lastWatchSent = 0L
             return

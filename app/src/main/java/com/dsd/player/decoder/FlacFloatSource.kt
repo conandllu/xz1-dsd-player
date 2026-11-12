@@ -87,6 +87,24 @@ class FlacFloatByteSource(
     /** 解码器实际输出位深（0=未知；4=float → 真 24bit） */
     @Volatile private var outEnc = 0
 
+    /**
+     * 跨解码缓冲的**残字节**（不足一帧的部分）。
+     *
+     * 真机第一百五十三轮：24bit 走自研 FLOAT 解码这条路会随机「嗞」，16bit（提取器直出 PCM）干净。
+     * 一个很容易被忽略的差异点就在这：解码器按自己的缓冲切分输出，**不保证按立体声帧对齐**；
+     * 以前每个输出缓冲各自转换成整帧、尾巴（最多 1 个样本）直接丢掉 →
+     * 丢掉的那 1 个样本会让后续 L/R 相位整体错位，且随机出现（取决于缓冲边界）。
+     * 现在把残字节留到下一次转换的开头，绝不丢样本。
+     */
+    private val carry = ByteArray(64)
+    private var carryLen = 0
+    /** 拼装缓冲：carry + 本次输出（仅当 carryLen>0 时才用） */
+    private val joinBuf = ByteArray(OUT_CAP + 64)
+    /** 统计：出现"不足一帧"的解码缓冲次数 / 累计残留字节 / 转换总帧数 */
+    private var statNonAligned = 0
+    private var statCarryBytes = 0
+    private var statFrames = 0L
+
     /** 下一个要喂的字节位置（任意偏移都行，解码器自己成帧） */
     private var nextReadPos = 0L
     private var headerSent = false
@@ -141,8 +159,12 @@ class FlacFloatByteSource(
     }
 
     /** 解码器失效：释放，让下一次 feed 重建并重喂合成头 */
+    /** 解码器重建次数（真机复测时看这个：>0 就有断点风险） */
+    private var codecRebuilds = 0
+
     private fun onCodecBroken() {
-        Log.w(tag, "解码器失效 → 重建（已喂到 $nextReadPos B）")
+        codecRebuilds++
+        Log.w(tag, "解码器失效 → 重建（第 $codecRebuilds 次，已喂到 $nextReadPos B）")
         releaseCodec()
         headerSent = false
         inputDone = false
@@ -170,7 +192,8 @@ class FlacFloatByteSource(
             "（需求 ${need}KB/s，${String.format("%.2f", ratio)}×实时）；块 $statChunks，" +
             "读源 ${statReadNs / 1_000_000}ms 入队 ${statQueueNs / 1_000_000}ms " +
             "解码 ${statDrainNs / 1_000_000}ms 转换 ${statConvNs / 1_000_000}ms " +
-            "等空间 ${statWaitNs / 1_000_000}ms 缓冲 ${filled / 1024}KB" +
+            "等空间 ${statWaitNs / 1_000_000}ms 缓冲 ${filled / 1024}KB " +
+            "解码器重建 $codecRebuilds 次 非帧对齐 $statNonAligned 次 结转 $statCarryBytes B" +
             (if (ratio < 0.98) " ⚠ 供数不足" else ""))
         statT0 = now
         statBytesAtT0 = produced
@@ -252,6 +275,7 @@ class FlacFloatByteSource(
         inputDone = false
         eof = false
         outEnc = 0
+        carryLen = 0
         nextReadPos = from?.offset ?: info.firstFrameOffset
         nextFrame = from
         blkLen = 0
@@ -278,12 +302,15 @@ class FlacFloatByteSource(
                         var n = 0
                         val buf = c.getOutputBuffer(idx)
                         if (buf != null && oi.size > 0) {
-                            val sz = minOf(oi.size, raw.size)
+                            // 16bit 输出会膨胀 2 倍，别把 outTmp 冲爆
+                            val maxIn = minOf(raw.size, if (outEnc == AudioFormat.ENCODING_PCM_FLOAT)
+                                OUT_CAP else OUT_CAP / 2)
+                            val sz = minOf(oi.size, maxIn)
                             buf.position(oi.offset)
                             buf.limit(oi.offset + sz)
                             buf.get(raw, 0, sz)
                             val tc = System.nanoTime()
-                            n = convert(raw, sz, outTmp)
+                            n = convertWithCarry(sz)
                             statConvNs += System.nanoTime() - tc
                         }
                         c.releaseOutputBuffer(idx, false)
@@ -336,7 +363,9 @@ class FlacFloatByteSource(
             if (nxt == null) finishInput(c)
             return true
         }
-        // 入队失败：解码器可能失效 → 重建后从同一帧重试
+        // 超时（输入队列暂时满）：不重建，回主循环继续抽输出，稍后重试同一帧
+        if (lastQueueTimeout) { return true }
+        // 真正的入队失败：解码器可能失效 → 重建后从同一帧重试
         if (feedRetry++ < 3) { onCodecBroken(); return true }
         Log.e(tag, "入队连续失败 ${feedRetry} 次，跳过该帧")
         feedRetry = 0
@@ -383,14 +412,24 @@ class FlacFloatByteSource(
         }
     }
 
+    /** 上一次 queue() 失败是否只是"输入缓冲暂时没空出来"（不是解码器坏了） */
+    private var lastQueueTimeout = false
+
     private fun queue(c: MediaCodec, data: ByteArray, from: Int, size: Int, ptsUs: Long): Boolean {
         val t0 = System.nanoTime()
+        lastQueueTimeout = false
         try {
             var off = from
             val end = from + size
             while (off < end) {
-                val idx = c.dequeueInputBuffer(200_000)
-                if (idx < 0) return false
+                var idx = c.dequeueInputBuffer(200_000)
+                if (idx < 0) {
+                    // 输入队列暂时满（通常是我们还没把输出抽干）→ 这是**正常**情况，
+                    // 绝不能当成"解码器失效"去重建（重建会丢掉已解码的输出 → 可闻的断点，
+                    // 真机第一百五十三轮 24bit 随机「嗞」的头号嫌疑）。再等一次，仍没有才报告超时。
+                    idx = c.dequeueInputBuffer(300_000)
+                }
+                if (idx < 0) { lastQueueTimeout = true; return false }
                 val ib = c.getInputBuffer(idx) ?: return false
                 ib.clear()
                 val take = minOf(ib.capacity(), end - off)
@@ -466,6 +505,55 @@ class FlacFloatByteSource(
             System.arraycopy(buf, 0, dst, 0, total)
             total
         }
+    }
+
+    /**
+     * 把 [carry] 中残留的不足一帧字节拼到本次输出前面，再转换；转换后把新的残字节存回去。
+     * 保证**任何时刻都不会丢样本**（这是 24bit 路径随机「嗞」的头号嫌疑）。
+     */
+    private fun convertWithCarry(n: Int): Int {
+        val frameIn = bytesPerInputFrame()
+        if (frameIn <= 0) return 0
+        val srcLen: Int
+        val src: ByteArray
+        if (carryLen > 0) {
+            System.arraycopy(carry, 0, joinBuf, 0, carryLen)
+            System.arraycopy(raw, 0, joinBuf, carryLen, n)
+            srcLen = carryLen + n
+            src = joinBuf
+        } else {
+            src = raw
+            srcLen = n
+        }
+        if (srcLen % frameIn != 0) {
+            statNonAligned++
+            if (statNonAligned <= 5 || statNonAligned % 100 == 0) {
+                Log.w(tag, "解码输出未按帧对齐：${srcLen} 字节 % ${frameIn} = ${srcLen % frameIn}" +
+                    "（累计 $statNonAligned 次；残字节会结转到下一次，不丢样本）")
+            }
+        }
+        val out = convert(src, srcLen, outTmp)
+        val frames = out / FRAME
+        statFrames += frames
+        val consumed = frames * frameIn
+        val tail = srcLen - consumed
+        if (tail > 0 && tail <= carry.size) {
+            System.arraycopy(src, consumed, carry, 0, tail)
+            carryLen = tail
+            statCarryBytes += tail
+        } else {
+            carryLen = 0
+        }
+        return out
+    }
+
+    /** 解码器"每帧"的输入字节数（按当前输出编码） */
+    private fun bytesPerInputFrame(): Int {
+        val bps = when (outEnc) {
+            AudioFormat.ENCODING_PCM_FLOAT -> 4
+            else -> CodecPcm.bytesPerSample(outEnc)
+        }
+        return if (bps > 0) bps * ch else 0
     }
 
     /** float32 → 24-in-32（左对齐 24bit）。手写位拼装，避开 ByteBuffer 逐样本开销 */
